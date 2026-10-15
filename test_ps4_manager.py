@@ -919,5 +919,310 @@ class TestPkgInstallFlow(unittest.TestCase):
         self.assertIsNone(view.server)
 
 
+class MockBinLoader:
+    """A payload server that answers the way GoldHEN's BinLoader does.
+
+    It greets a new client with a banner (GoldHEN's own text), swallows
+    everything the client sends and can reply afterwards. ``banner=""`` is the
+    common real case: BinLoader connects and simply says nothing.
+    """
+
+    def __init__(self, banner: str = "GoldHEN BinLoader v2.4b18.3\n", reply: str = "") -> None:
+        self.banner = banner
+        self.reply = reply
+        self.received = b""
+        self.connections = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self._stop = False
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while not self._stop:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(3.0)
+            if self.banner:
+                conn.sendall(self.banner.encode("utf-8"))
+            chunks = []
+            while True:
+                try:
+                    chunk = conn.recv(65536)
+                except (socket.timeout, OSError):
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            self.received += b"".join(chunks)
+            if self.reply:
+                conn.sendall(self.reply.encode("utf-8"))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class TestPayloaderClient(unittest.TestCase):
+    """The GoldHEN payload server client, against a stand-in server."""
+
+    def setUp(self) -> None:
+        self.mock = MockBinLoader()
+
+    def tearDown(self) -> None:
+        self.mock.close()
+
+    def make(self) -> "m.Payloader":
+        return m.Payloader("127.0.0.1", self.mock.port, timeout=3)
+
+    def test_connect_reads_the_banner_and_stays_open(self) -> None:
+        payloader = self.make()
+        banner = payloader.connect()
+        self.assertIn("GoldHEN", banner)
+        self.assertTrue(payloader.connected)
+        self.assertIn("GoldHEN", payloader.banner_summary())
+        payloader.close()
+        self.assertFalse(payloader.connected)
+
+    def test_a_silent_server_is_still_a_working_payloader(self) -> None:
+        self.mock.close()
+        self.mock = MockBinLoader(banner="")     # BinLoader usually says nothing
+        payloader = self.make()
+        self.assertEqual(payloader.connect(), "")
+        self.assertTrue(payloader.connected, "silence is not an error")
+        self.assertEqual(payloader.banner_summary(), "payload server ready")
+        payloader.close()
+
+    def test_probe_describes_and_disconnects(self) -> None:
+        payloader = self.make()
+        self.assertIn("GoldHEN", payloader.probe())
+        self.assertFalse(payloader.connected, "a probe must not leave the socket open")
+
+    def test_nothing_listening_is_a_friendly_error(self) -> None:
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        dead_port = spare.getsockname()[1]
+        spare.close()                             # nothing listens on it now
+        payloader = m.Payloader("127.0.0.1", dead_port, timeout=2)
+        with self.assertRaises(m.PayloaderError) as caught:
+            payloader.connect()
+        message = str(caught.exception)
+        self.assertIn("Nothing is listening", message)
+        self.assertIn("BinLoader", message)
+        self.assertFalse(payloader.connected)
+
+    def test_a_payload_reaches_the_console_byte_for_byte(self) -> None:
+        self.mock.reply = "OK"
+        data = bytes(range(256)) * 300            # 76 KB: more than one chunk
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "installer.bin"
+            payload.write_bytes(data)
+            seen = []
+            payloader = self.make()
+            payloader.connect()
+            reply = payloader.send_file(payload, progress=lambda done, total: seen.append((done, total)))
+        self.assertEqual(reply, "OK")
+        self.assertEqual(self.mock.received, data)
+        self.assertEqual(seen[-1], (len(data), len(data)))
+        self.assertEqual(seen[-1][0], seen[-1][1])
+        self.assertFalse(payloader.connected, "binloader is done with the connection after a payload")
+
+    def test_sending_without_a_connection_is_an_error(self) -> None:
+        payloader = self.make()
+        with self.assertRaises(m.PayloaderError):
+            payloader.send_bytes(b"\x00")
+
+
+class TestPayloaderSettings(unittest.TestCase):
+    """An address in the settings is the opt-in - nothing else to press."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_config_file = m.CONFIG_FILE
+        m.CONFIG_FILE = Path(self._tmp.name) / "ps4_manager_config.json"
+
+    def tearDown(self) -> None:
+        m.CONFIG_FILE = self._real_config_file
+        self._tmp.cleanup()
+
+    def test_an_empty_address_means_off(self) -> None:
+        for host in ("", "   ", "\t"):
+            self.assertFalse(m.Config(payloader_host=host).payloader_enabled, repr(host))
+        self.assertTrue(m.Config(payloader_host=" 192.168.1.50 ").payloader_enabled)
+
+    def test_the_address_and_port_survive_a_restart(self) -> None:
+        m.Config(host="192.168.1.50", payloader_host=" 192.168.1.50 ", payloader_port=9020).save()
+        again = m.Config.load()
+        self.assertEqual(again.payloader_host, " 192.168.1.50 ")   # load keeps the file's value
+        self.assertEqual(again.payloader_port, 9020)
+        self.assertTrue(again.payloader_enabled)
+        self.assertEqual(again.payloader_target(), "192.168.1.50:9020")
+        # an old config file has no payloader keys at all: GoldHEN's default applies
+        Path(m.CONFIG_FILE).write_text(json.dumps({"host": "192.168.1.50"}), encoding="utf-8")
+        fresh = m.Config.load()
+        self.assertEqual(fresh.payloader_port, m.DEFAULT_PAYLOAD_PORT)
+        self.assertEqual(m.DEFAULT_PAYLOAD_PORT, 9090)
+        self.assertFalse(fresh.payloader_enabled)
+
+    def test_a_hand_edited_port_is_repaired(self) -> None:
+        for broken in (0, -5, "nonsense"):
+            config = m.Config(payloader_host="192.168.1.50", payloader_port=broken)  # type: ignore[arg-type]
+            self.assertEqual(config.payloader_port_number(), m.DEFAULT_PAYLOAD_PORT, repr(broken))
+            self.assertEqual(config.payloader_target(), "192.168.1.50:9090")
+            self.assertEqual(config.make_payloader().port, 9090)
+
+
+class FakeFtp:
+    """Stand-in for the console's FTP connection; these tests are about the payloader."""
+
+    def __init__(self) -> None:
+        self.connected_calls = 0
+        self.close_calls = 0
+
+    def connect(self) -> None:
+        self.connected_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeConfig(m.Config):
+    """Config that hands out a FakeFtp, so no console is needed here.
+
+    The FTP stand-in is a class attribute on purpose: an instance attribute
+    would land in Config.__dict__, and saving the settings writes that dict as
+    JSON - a function in there is not serialisable.
+    """
+
+    fake_ftp: "FakeFtp"
+
+    def make_ftp(self, logger=None) -> "FakeFtp":      # type: ignore[override]
+        return FakeConfig.fake_ftp
+
+
+class TestPayloaderConnectFlow(unittest.TestCase):
+    """One Connect press opens FTP *and* the payload server - no second button."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_config_file = m.CONFIG_FILE
+        m.CONFIG_FILE = Path(self._tmp.name) / "ps4_manager_config.json"
+        self.mock = MockBinLoader()
+        self.ftp = FakeFtp()
+        FakeConfig.fake_ftp = self.ftp
+        self.app = m.Ps4ManagerApp(FakeConfig(host="192.168.1.50", auto_connect=False))
+        self.app.geometry("1080x700+40+40")
+        self.app.withdraw()
+        self.pump(0.4)          # let the app's own startup status line land first
+
+    def tearDown(self) -> None:
+        try:
+            self.app.worker.stop()
+            self.app.destroy()
+        except Exception:
+            pass
+        self.mock.close()
+        m.CONFIG_FILE = self._real_config_file
+        self._tmp.cleanup()
+
+    def pump(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end:
+            self.app.update()
+            time.sleep(0.03)
+
+    def connect(self, host: str = "", port: int = 0) -> None:
+        self.app.config.payloader_host = host
+        if port:
+            self.app.config.payloader_port = port
+        self.app.connect_async(load=False, announce=False)
+        self.pump(3.0)
+
+    def test_one_connect_brings_up_the_ftp_and_the_payload_server(self) -> None:
+        self.connect("127.0.0.1", self.mock.port)
+        self.assertEqual(self.ftp.connected_calls, 1)
+        self.assertIs(self.app.ftp, self.ftp)
+        self.assertIsNotNone(self.app.payloader)
+        self.assertTrue(self.app.payloader.connected)
+        self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload ready")
+        self.assertIn("payload server ready", self.app.status_label.cget("text").lower())
+        self.assertIn("Payload server ready", self.app.log_text.get("1.0", "end"))
+        self.assertEqual(self.mock.connections, 1)
+        # Disconnect must close both, and say so
+        self.app.disconnect()
+        self.pump(0.3)
+        self.assertIsNone(self.app.payloader)
+        self.assertIsNone(self.app.ftp)
+        self.assertEqual(self.ftp.close_calls, 1)
+        self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload off")
+
+    def test_a_dead_payload_server_never_costs_the_ftp_session(self) -> None:
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        dead_port = spare.getsockname()[1]
+        spare.close()
+        self.connect("127.0.0.1", dead_port)
+        self.assertIs(self.app.ftp, self.ftp, "the FTP side must still be up")
+        self.assertIsNone(self.app.payloader)
+        self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload no reply")
+        status = self.app.status_label.cget("text").lower()
+        self.assertIn("ftp only", status)
+        self.assertIn("nothing is listening", status)
+
+    def test_without_an_address_the_payloader_is_never_touched(self) -> None:
+        self.connect("")
+        self.assertIs(self.app.ftp, self.ftp)
+        self.assertIsNone(self.app.payloader)
+        self.assertEqual(self.mock.connections, 0, "no address saved -> no payloader traffic")
+        self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload off")
+
+    def test_the_settings_card_drives_all_of_it(self) -> None:
+        view = self.app.views["settings"]
+        view.vars["host"].set("192.168.1.50")
+        view.vars["payloader_host"].set("")
+        view._refresh_payloader_hint()
+        self.assertIn("FTP only", view.payload_result.cget("text"))
+        # the copy button saves the user from typing the same address twice
+        view._copy_host_to_payloader()
+        self.assertEqual(view.vars["payloader_host"].get(), "192.168.1.50")
+        self.assertIn("filled in for the payload server", view.payload_result.cget("text"))
+        view._refresh_payloader_hint()        # what the card says once it settles
+        self.assertIn("also open the payload server", view.payload_result.cget("text"))
+        # it is saved as a real number, not as the text that was typed
+        view.vars["payloader_host"].set("127.0.0.1")
+        view.vars["payloader_port"].set(str(self.mock.port))
+        self.assertTrue(view.save(quiet=True))
+        stored = json.loads(Path(m.CONFIG_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(stored["payloader_host"], "127.0.0.1")
+        self.assertEqual(stored["payloader_port"], self.mock.port)
+        self.assertNotIn("payloader_enabled", stored, "enabled is derived from the address, not stored")
+        self.assertTrue(self.app.config.payloader_enabled)
+        # Test payload server probes what is typed right now
+        view.test_payloader()
+        self.pump(3.0)
+        self.assertIn("GoldHEN", view.payload_result.cget("text"))
+        self.assertEqual(self.app.worker.busy, 0, "the busy indicator must be cleared")
+        self.assertEqual(self.mock.connections, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

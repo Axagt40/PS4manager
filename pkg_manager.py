@@ -110,7 +110,7 @@ def looks_like_manifest(url: str) -> bool:
 
 
 def title_id_from_name(name: str) -> Optional[str]:
-    """Pull a PS4 title id (CUSA12345, and homebrew ids like ITEM00001) out of a name."""
+    """Pull a PS4 title id (CUSA12345, and homebrew ids like ABCD00001) out of a name."""
     match = _TITLE_ID.search((name or "").upper())
     return match.group(1) if match else None
 

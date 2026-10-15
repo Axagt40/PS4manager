@@ -82,6 +82,21 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 - The password (only needed for non-anonymous logins) is stored as plain text in the config file and
   the card says so.
 
+**Payload server (optional)**
+- Settings has a **Payload server** card for GoldHEN's payload server (*BinLoader*, default port
+  `9090`). Fill in the address and it connects **together with FTP, on the same Connect button** —
+  no second button and no second step. A second pill in the header says *Payload off*,
+  *Payload ready* or *Payload no reply*, and a payload server that stays silent never costs you the
+  FTP session: you still get connected, the status line just says "FTP only" and why.
+- Leave the address empty and the manager never opens the port. *Use the PS4 address above* copies
+  the console's IP, *Test payload server* reports what answered and probes what is typed right now,
+  even before saving.
+- The app ships **no payload** of its own. `Payloader` (in `ps4_manager.py`) can push a payload file
+  you supply — that is the hook the next features use, rather than bundling somebody's binary.
+- GoldHEN's BinLoader is marked *experimental* and on some builds stops listening after a single
+  connection: if the pill reads *Payload no reply* while GoldHEN is running, toggle BinLoader on the
+  console again.
+
 **Comforts**
 - Dark, minimal flat theme built with the standard library (no Qt, no pip).
 - All network and file work runs on background threads — the window never freezes, transfers
