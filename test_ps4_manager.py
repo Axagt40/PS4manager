@@ -14,9 +14,12 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import shutil
 import socket
 import socketserver
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1222,6 +1225,21 @@ class TestPayloaderConnectFlow(unittest.TestCase):
         self.assertIn("GoldHEN", view.payload_result.cget("text"))
         self.assertEqual(self.app.worker.busy, 0, "the busy indicator must be cleared")
         self.assertEqual(self.mock.connections, 1)
+
+
+class TestMissingSiblingModule(unittest.TestCase):
+    """ps4_manager.py and pkg_manager.py ship together - and must say so."""
+
+    def test_a_missing_pkg_manager_gives_a_clear_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ps4_manager.py"
+            shutil.copy(m.__file__, target)          # the real app, with no pkg_manager next to it
+            result = subprocess.run([sys.executable, str(target), "--version"],
+                                    capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(result.returncode, 0, "a missing module must not look like success")
+        self.assertIn("pkg_manager.py is missing", result.stderr)
+        self.assertIn("Axagt40/PS4manager", result.stderr)
+        self.assertNotIn("Traceback", result.stderr, "no raw traceback for a missing file")
 
 
 if __name__ == "__main__":

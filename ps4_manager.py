@@ -44,7 +44,17 @@ import functools
 import io
 import json
 import os
-import pkg_manager
+try:
+    import pkg_manager
+except ImportError as _missing:
+    # The PKG manager's back end ships beside this file. If somebody copies
+    # only ps4_manager.py, say what is wrong instead of dumping a traceback.
+    raise SystemExit(
+        "PS4 Manager cannot start: pkg_manager.py is missing.\n"
+        "It belongs in the same folder as ps4_manager.py (the PKG manager's "
+        "back end).\nCopy it from the project folder on GitHub "
+        "(github.com/Axagt40/PS4manager) and start the app again."
+    ) from _missing
 import platform
 import queue
 import re
@@ -62,7 +72,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_PORT = 2121
 # GoldHEN's payload server ("BinLoader"). 9090 is the default; GoldHEN can also
 # listen on 9020/9021, which is why the port is configurable.
