@@ -72,12 +72,25 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 DEFAULT_PORT = 2121
 # GoldHEN's payload server ("BinLoader"). 9090 is the default; GoldHEN can also
 # listen on 9020/9021, which is why the port is configurable - and why the app
 # tries all three before it reports that nothing is listening.
 DEFAULT_PAYLOAD_PORT = 9090
+
+# The "connected" notification. A PS4 has no notification API reachable over the
+# network - the only thing that can draw one is a payload - so the app ships a
+# tiny payload of its own (payloads/, source included) and pushes it through
+# BinLoader after a successful connect. The switch in the settings turns the
+# whole thing off.
+NOTIFY_PAYLOAD_FILE = Path("payloads") / "notify.elf"
+NOTIFY_TIMEOUT = 3.0    # a console on the LAN answers at once; never hang here
+# Starting the console-side installer (port 12800) uses the same route, except
+# that the app ships no installer payload: it uses one the user dropped into
+# payloads/ (see pkg_manager.INSTALLER_PAYLOAD_NAMES). A payload server gets a
+# little longer here, because this file is bigger than the notification's.
+INSTALLER_PAYLOAD_TIMEOUT = 6.0
 PAYLOAD_PORT_CHOICES = (DEFAULT_PAYLOAD_PORT, 9020, 9021)
 DEFAULT_INI = "/data/GoldHEN/plugins.ini"
 DEFAULT_PLUGINS_DIR = "/data/GoldHEN/plugins"
@@ -1130,7 +1143,8 @@ class Payloader:
             return f"Timed out talking to the payload server at {self.host}:{self.port}."
         if "refused" in str(exc).lower():
             return (f"Nothing is listening on {self.host}:{self.port}.\n"
-                    "Turn on the payload server (BinLoader) in GoldHEN's settings on the PS4.")
+                    "On the PS4, open GoldHEN's menu and switch the payload server on: "
+                    "Settings -> Servers -> BinLoader (port 9090 unless you changed it).")
         return f"Could not reach the payload server at {self.host}:{self.port}: {exc}"
 
     def _log(self, message: str) -> None:
@@ -1217,8 +1231,76 @@ def connect_payloader(host: str, port: int = DEFAULT_PAYLOAD_PORT, timeout: floa
             logger(f"The payload server answered on port {candidate}, not {wanted}.")
         return payloader, ""
     return None, (f"no payload server on {str(host).strip()} "
-                  f"(tried {', '.join(str(p) for p in ports)}) - "
-                  "switch BinLoader on in GoldHEN's settings")
+                  f"(tried {', '.join(str(p) for p in ports)}) - on the PS4 open GoldHEN's menu, "
+                  "Settings -> Servers, and switch BinLoader on")
+
+
+def payloads_dir() -> Path:
+    """The folder next to the app that holds every payload the app may send."""
+    return app_dir() / "payloads"
+
+
+def notify_payload_path() -> Path:
+    """Where the "connected" notification payload lives: next to the app."""
+    return app_dir() / NOTIFY_PAYLOAD_FILE
+
+
+def push_installer_payload(config: "Config", path: Any,
+                           logger: Optional[Callable[[str], None]] = None) -> str:
+    """Push one installer payload to the console's payload server (BinLoader).
+
+    Returns the console's reply. Raises :class:`PayloaderError` when it cannot
+    go at all - BinLoader switched off, nothing listening, the connection dying
+    half way - which is what :func:`pkg_manager.ensure_installer_running` turns
+    into a line in the log and the setup notes.  Like the notification, this
+    reaches the console through the saved payloader address when there is one
+    and through the FTP address otherwise: it is the same console.
+    """
+    host = str(config.payloader_host or "").strip() or str(config.host or "").strip()
+    if not host:
+        raise PayloaderError("there is no PS4 address to send it to")
+    payloader, error = connect_payloader(host, config.payloader_port_number(),
+                                         timeout=INSTALLER_PAYLOAD_TIMEOUT, logger=logger)
+    if payloader is None:
+        raise PayloaderError(error)
+    try:
+        return payloader.send_file(Path(path))
+    finally:
+        payloader.close()
+
+
+def send_connect_notification(config: "Config",
+                              logger: Optional[Callable[[str], None]] = None,
+                              payload_path: Optional[Any] = None) -> Tuple[bool, str]:
+    """Draw the "PS4 Manager connected" notification on the console.
+
+    Returns (shown, message), where the message is the line for the log. This
+    never raises: BinLoader being switched off, or the payload not being there,
+    must cost the connection nothing - it is one line of text, nothing more.
+
+    The console is reached through the saved payloader address when there is
+    one, and through the FTP address otherwise - it is the same console, so the
+    user only has to keep one address up to date.
+    """
+    path = Path(payload_path) if payload_path is not None else notify_payload_path()
+    if not path.is_file():
+        return False, (f"Notification skipped: {path} is missing (the payload ships "
+                       "next to the app, in payloads/).")
+    host = str(config.payloader_host or "").strip() or str(config.host or "").strip()
+    if not host:
+        return False, "Notification skipped: there is no PS4 address to send it to."
+    payloader, error = connect_payloader(host, config.payloader_port_number(),
+                                         timeout=NOTIFY_TIMEOUT, logger=logger)
+    if payloader is None:
+        return False, f"Notification not shown: {error}"
+    try:
+        reply = payloader.send_file(path)
+    except PayloaderError as exc:
+        return False, f"Notification not shown: {exc}"
+    finally:
+        payloader.close()
+    return True, (f"Notification shown on the PS4 ({path.name} sent to {host})"
+                  + (f"; the console said: {Payloader.one_line(reply)}" if reply else "."))
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1326,12 @@ class Config:
     # connects to it together with FTP, and an empty address leaves it alone.
     payloader_host: str = ""
     payloader_port: int = DEFAULT_PAYLOAD_PORT
+    # Show our "PS4 Manager connected" notification on the console after a
+    # successful connect. Off by default on purpose: it needs GoldHEN's BinLoader,
+    # it uses that server's single connection, and on some builds a notification
+    # sent by a payload never renders - so it is something you switch on, not
+    # something that happens to you. The payload ships with the app (payloads/).
+    notify_on_connect: bool = False
     window_geometry: str = ""
     recent_hosts: List[str] = field(default_factory=list)
 
@@ -2967,16 +3055,23 @@ What has to run on the PS4
      background app, and that stops the download.
   4. Back here, press "Check console".
 
-Alternative - GoldHEN's payload server
-  Turn on BinLoader / the payload server in GoldHEN's settings (ports 9090,
-  9020, 9021) and use a PC tool that pushes its own installer payload; the
-  service it leaves running on 12800 is the same API this app speaks. This app
-  ships no third-party payload on purpose, so the app above is the one to use.
-  Save its address under Settings -> "Payload server (optional)" and the
-  manager connects to it together with FTP, the header showing whether it
-  answered. GoldHEN's BinLoader is experimental and on some builds stops
-  listening after one connection - if the pill says "Payload no reply", toggle
-  BinLoader on the console again.
+Alternative - let this manager start it for you
+  The same service can be started without that homebrew app: the PC tools in the
+  scene push a small payload through GoldHEN's BinLoader, and the service it
+  leaves running on 12800 is the same API this app speaks. Drop such a payload
+  into the payloads/ folder next to the app (rpi.bin, rpi.elf, installer.bin or
+  installer.elf) and the PKG manager sends it by itself the first time it finds
+  12800 dead - this app ships no third-party payload, so that file has to be one
+  you put there yourself.
+
+  It needs the payload server switched on in GoldHEN's settings (ports 9090,
+  9020, 9021), saved here under Settings -> "Payload server (optional)"; the
+  manager then connects to it together with FTP, and the header shows whether it
+  answered. GoldHEN's BinLoader is experimental: on some builds it stops
+  listening after one connection, and on others a payload sent through it does
+  not start at all. If the pill says "Payload no reply", toggle BinLoader on the
+  console again; if the port stays dead after the payload was sent, the homebrew
+  app above is the route that always works.
 
 Without that service the rest of this page still works
   "Send a .pkg ..." moves packages onto the console over FTP and deletes them
@@ -3037,6 +3132,10 @@ class PkgManagerView(tk.Frame):
         self.local_pkg: Optional[Path] = None
         self._poll_id: Optional[str] = None
         self._checked = False
+        # The installer payload is pushed at most once per session: GoldHEN's
+        # BinLoader takes a single connection, so a second push would only
+        # disturb whatever else is using it.
+        self._start_attempted = False
         self.console_rows: Dict[str, RemoteEntry] = {}
         self.installed_rows: Dict[str, RemoteEntry] = {}
 
@@ -3215,7 +3314,9 @@ class PkgManagerView(tk.Frame):
     def on_shown(self) -> None:
         if not self._checked:
             self._checked = True
-            self.check_service(quiet=True)
+            # quiet: opening the page must not overwrite the status line, and it
+            # is allowed to start the service once (see _start_attempted)
+            self.check_service(quiet=True, start=not self._start_attempted)
         if self.app.ftp is not None:
             self.refresh_console_pkgs()
             self.refresh_installed()
@@ -3225,44 +3326,70 @@ class PkgManagerView(tk.Frame):
         self._stop_server()
 
     # -- installer service -------------------------------------------------
-    def check_service(self, quiet: bool = False) -> None:
+    def check_service(self, quiet: bool = False, start: bool = True) -> None:
+        """Ask the console's installer service - starting it when it is missing.
+
+        ``start=False`` only asks. The automatic calls (opening this page, a
+        second install) pass that, because the payload is worth sending once and
+        not once per click.
+        """
         installer = self.make_installer()
         if installer is None:
             return
+        self.ensure_service(installer, quiet=quiet, allow_start=start)
+
+    def ensure_service(self, installer: pkg_manager.RemoteInstaller,
+                       then: Optional[Callable[[], None]] = None,
+                       quiet: bool = False, allow_start: bool = True) -> None:
+        """Bring the console-side installer up, running ``then`` once it answers.
+
+        One worker job, three steps, each only when the one before it came up
+        empty: ask the service, push the installer payload the user left in
+        payloads/ through GoldHEN's BinLoader, then wait for the service to
+        answer. ``then`` runs only after it does - so an install that needs the
+        service starts it on its own, and one that cannot gets the setup notes
+        instead of an error.
+        """
+        payload = pkg_manager.find_installer_payload(payloads_dir()) if allow_start else None
+        if payload is not None:
+            self._start_attempted = True
         self.service_pill.set("Checking ...", Theme.warn)
         self.service_label.configure(text="Looking for the installer service on "
                                           f"{installer.host}:{installer.port} ...", fg=Theme.text_dim)
 
-        def work() -> bool:
-            return installer.probe()
+        def work() -> Tuple[bool, str]:
+            # bg_log, not self.log: Tk may only be touched from the UI thread
+            return pkg_manager.ensure_installer_running(
+                installer, payload=payload,
+                push=lambda path: push_installer_payload(self.app.config, path, logger=self.bg_log),
+                logger=self.bg_log)
 
-        def done(ready: bool) -> None:
-            self.installer = installer if ready else None
-            if ready:
-                self.service_pill.set("Installer ready", Theme.good)
-                self.service_label.configure(
-                    text=f"Remote Package Installer is running on {installer.host}:{installer.port} - "
-                         "packages can be installed and removed from here.", fg=Theme.text)
-                self.uninstall_button.set_enabled(True)
-                self.apps_hint.configure(text="")
-            else:
-                self.service_pill.set("Installer not running", Theme.warn)
-                self.service_label.configure(
-                    text=f"Nothing answers on {installer.host}:{installer.port}. Press \"How to set it up\" "
-                         "for the one-time install, then \"Check console\" again. Everything else on this "
-                         "tab (sending files, listing, deleting) works right now.", fg=Theme.warn)
-                self.uninstall_button.set_enabled(False)
-                self.apps_hint.configure(text="Uninstalling needs the installer service.")
+        def done(result: Tuple[bool, str]) -> None:
+            ready, message = result
+            if not ready:
+                self.installer = None
+                self.warn_no_service(message, announce=not quiet)   # logs the reason
+                return
+            # one line either way: the log says whether the service was there
+            # already or whether the app started it with the payload
+            self.app.log(message)
+            self.installer = installer
+            self.service_pill.set("Installer ready", Theme.good)
+            self.service_label.configure(
+                text=f"Remote Package Installer is running on {installer.host}:{installer.port} - "
+                     "packages can be installed and removed from here.", fg=Theme.text)
+            self.uninstall_button.set_enabled(True)
+            self.apps_hint.configure(text="")
             if not quiet:
-                self.app.set_status("Console installer ready." if ready
-                                    else "No installer service on the console yet - see the setup notes.",
-                                    "good" if ready else "warn")
+                self.app.set_status("Console installer ready.", "good")
+            if then is not None:
+                then()
 
         def failed(exc: BaseException) -> None:
             self.service_pill.set("Installer not running", Theme.warn)
             self.service_label.configure(text=f"Could not check the console: {exc}", fg=Theme.warn)
 
-        self.app.worker.submit(work, done, failed, name="pkg-probe")
+        self.app.worker.submit(work, done, failed, name="pkg-service")
 
     def show_setup(self) -> None:
         PkgSetupDialog(self.app, self.console_host()).show()
@@ -3298,26 +3425,28 @@ class PkgManagerView(tk.Frame):
         installer = self.make_installer()
         if installer is None:
             return
-        if not installer.probe():
-            self.warn_no_service()
-            return
-        self.installer = installer
-        self.app.begin_busy("Asking the PS4 to download the package ...")
 
-        def work() -> pkg_manager.InstallTask:
-            if pkg_manager.looks_like_manifest(url):
-                return installer.install_manifest(url)
-            return installer.install_direct([url])
+        def start() -> None:
+            self.installer = installer
+            self.app.begin_busy("Asking the PS4 to download the package ...")
 
-        def done(task: pkg_manager.InstallTask) -> None:
-            self.app.end_busy()
-            self.start_tracking(task, source=url)
+            def work() -> pkg_manager.InstallTask:
+                if pkg_manager.looks_like_manifest(url):
+                    return installer.install_manifest(url)
+                return installer.install_direct([url])
 
-        def failed(exc: BaseException) -> None:
-            self.app.end_busy()
-            self.install_failed(exc)
+            def done(task: pkg_manager.InstallTask) -> None:
+                self.app.end_busy()
+                self.start_tracking(task, source=url)
 
-        self.app.worker.submit(work, done, failed, name="pkg-install-link")
+            def failed(exc: BaseException) -> None:
+                self.app.end_busy()
+                self.install_failed(exc)
+
+            self.app.worker.submit(work, done, failed, name="pkg-install-link")
+
+        # the service is started for us here when it is missing - see ensure_service
+        self.ensure_service(installer, then=start)
 
     def install_from_pc(self) -> None:
         path = self.local_pkg
@@ -3332,42 +3461,58 @@ class PkgManagerView(tk.Frame):
         installer = self.make_installer()
         if installer is None:
             return
-        if not installer.probe():
-            self.warn_no_service()
-            return
-        host = installer.host
-        ip = pkg_manager.local_ip_for(host)
-        if not ip:
-            self.app.set_status("This PC has no network route to the console - is the LAN up?", "bad")
-            return
-        files = pkg_manager.split_package_parts(path) if self.var_parts.get() else [path]
-        server = pkg_manager.LocalPkgServer(files, ip, allow_from=host, logger=self.bg_log)
-        self.installer = installer
-        self.app.begin_busy(f"Streaming {path.name} to the PS4 ...")
 
-        def work() -> pkg_manager.InstallTask:
-            server.start()
-            urls = server.urls()
-            self.app.log("Serving " + ", ".join(urls))
-            return installer.install_direct(urls)
+        def start() -> None:
+            host = installer.host
+            ip = pkg_manager.local_ip_for(host)
+            if not ip:
+                self.app.set_status("This PC has no network route to the console - is the LAN up?", "bad")
+                return
+            files = pkg_manager.split_package_parts(path) if self.var_parts.get() else [path]
+            server = pkg_manager.LocalPkgServer(files, ip, allow_from=host, logger=self.bg_log)
+            self.installer = installer
+            self.app.begin_busy(f"Streaming {path.name} to the PS4 ...")
 
-        def done(task: pkg_manager.InstallTask) -> None:
-            self.app.end_busy()
-            self.server = server
-            self.start_tracking(task, source=f"{path.name} via {ip}:{server.port}")
+            def work() -> pkg_manager.InstallTask:
+                server.start()
+                urls = server.urls()
+                self.app.log("Serving " + ", ".join(urls))
+                return installer.install_direct(urls)
 
-        def failed(exc: BaseException) -> None:
-            self.app.end_busy()
-            server.stop()
-            self.install_failed(exc)
+            def done(task: pkg_manager.InstallTask) -> None:
+                self.app.end_busy()
+                self.server = server
+                self.start_tracking(task, source=f"{path.name} via {ip}:{server.port}")
 
-        self.app.worker.submit(work, done, failed, name="pkg-install-local")
+            def failed(exc: BaseException) -> None:
+                self.app.end_busy()
+                server.stop()
+                self.install_failed(exc)
 
-    def warn_no_service(self) -> None:
-        host = self.console_host()
+            self.app.worker.submit(work, done, failed, name="pkg-install-local")
+
+        # the service is started for us here when it is missing - see ensure_service
+        self.ensure_service(installer, then=start)
+
+    def warn_no_service(self, reason: str = "", announce: bool = True) -> None:
+        """Report the missing console-side service, and where to read about it.
+
+        The log keeps the reason as it came, which names the port that was really
+        tried - that is what has to be fixed. The status line talks about 12800
+        instead, because that is the port the one-time setup opens.
+        """
+        host = self.console_host() or "the PS4"
+        headline = f"Nothing answers on {host}:{pkg_manager.RPI_PORT}"
         self.service_pill.set("Installer not running", Theme.warn)
-        self.app.set_status(f"Nothing answers on {host}:{pkg_manager.RPI_PORT} - press "
-                            "\"How to set it up\" in the PKG manager for the one-time install.", "warn")
+        self.service_label.configure(
+            text=(reason or headline) + "  Press \"How to set it up\" for the one-time console-side "
+            "install, then \"Check console\" again.", fg=Theme.warn)
+        self.uninstall_button.set_enabled(False)
+        self.apps_hint.configure(text="Uninstalling needs the installer service.")
+        self.app.log(reason or headline)
+        if announce:
+            self.app.set_status(f"{headline} - press \"How to set it up\" in the PKG manager for the "
+                                "one-time install.", "warn")
 
     def install_failed(self, exc: BaseException) -> None:
         self.app.set_status(f"Install failed: {exc}", "bad")
@@ -3630,26 +3775,28 @@ class PkgManagerView(tk.Frame):
                 "The application is removed from the PS4. Saved data is left alone.",
                 parent=self):
             return
-        if not installer.probe():
-            self.warn_no_service()
-            return
         self.installer = installer
-        self.app.begin_busy(f"Uninstalling {title_id} ...")
 
-        def work() -> str:
-            installer.uninstall("game", title_id)
-            return title_id
+        def start() -> None:
+            self.app.begin_busy(f"Uninstalling {title_id} ...")
 
-        def done(removed: str) -> None:
-            self.app.end_busy()
-            self.app.set_status(f"Uninstalled {removed} from the PS4.", "good")
-            self.refresh_installed()
+            def work() -> str:
+                installer.uninstall("game", title_id)
+                return title_id
 
-        def failed(exc: BaseException) -> None:
-            self.app.end_busy()
-            self.app.set_status(f"Uninstall failed: {exc}", "bad")
+            def done(removed: str) -> None:
+                self.app.end_busy()
+                self.app.set_status(f"Uninstalled {removed} from the PS4.", "good")
+                self.refresh_installed()
 
-        self.app.worker.submit(work, done, failed, name="pkg-uninstall")
+            def failed(exc: BaseException) -> None:
+                self.app.end_busy()
+                self.app.set_status(f"Uninstall failed: {exc}", "bad")
+
+            self.app.worker.submit(work, done, failed, name="pkg-uninstall")
+
+        # uninstalling needs the service just as installing does
+        self.ensure_service(installer, then=start)
 
 
 class SettingsView(VScrollFrame):
@@ -3690,7 +3837,7 @@ class SettingsView(VScrollFrame):
             if var is not None:
                 var.trace_add("write", lambda *_a: self._refresh_saved())
         self._refresh_saved()
-        for key in ("payloader_host", "payloader_port"):
+        for key in ("payloader_host", "payloader_port", "notify_on_connect"):
             var = self.vars.get(key)
             if var is not None:
                 var.trace_add("write", lambda *_a: self._refresh_payloader_hint())
@@ -3776,10 +3923,18 @@ class SettingsView(VScrollFrame):
             "here. Save its address and the manager connects to it together with FTP: one "
             "Connect button, nothing extra to press. Empty means the manager stays on FTP only. "
             "GoldHEN may listen on 9090, 9020 or 9021 - all three are tried, so the port only "
-            "has to be right if you changed it yourself.")
+            "has to be right if you changed it yourself. Only two things ever send a payload: "
+            "the notification switch below, which sends the app's own payloads/notify.elf, and "
+            "the PKG manager, which starts the console's installer service with an installer "
+            "payload you put in payloads/ yourself when port 12800 is dead. Both write nothing "
+            "to the PS4, and switching the notification off means only the PKG manager's own "
+            "payload can ever go out.")
         self._entry_row(body, "payloader_host", "PS4 address", hint="empty = payloader off", width=22)
         self._entry_row(body, "payloader_port", "Payload port", default=str(DEFAULT_PAYLOAD_PORT),
                         hint="9090 in GoldHEN unless you changed it", width=10)
+        self._switch_row(body, "notify_on_connect", "Tell the PS4 when the manager connects",
+                         hint="sends the app's own payload once per connect; needs BinLoader and "
+                              "a build that shows payload notifications", default=False)
         actions = self._row(body, "")
         CButton(actions, "Use the PS4 address above", command=self._copy_host_to_payloader,
                 bg=Theme.surface, height=30).pack(side="left")
@@ -3795,11 +3950,32 @@ class SettingsView(VScrollFrame):
         host = str(self.vars["payloader_host"].get() or "").strip()
         port = str(self.vars["payloader_port"].get() or "").strip() or str(DEFAULT_PAYLOAD_PORT)
         if host:
-            self.payload_result.configure(
-                text=f"✔  Connect will also open the payload server at {host}:{port}.", fg=Theme.good)
+            text, fg = f"✔  Connect will also open the payload server at {host}:{port}.", Theme.good
         else:
-            self.payload_result.configure(
-                text="No payloader address saved - the manager connects over FTP only.", fg=Theme.muted)
+            text = "No payloader address saved - the manager connects over FTP only."
+            fg = Theme.muted
+        notify = self.vars.get("notify_on_connect")
+        if notify is not None and bool(notify.get()) and not notify_payload_path().is_file():
+            text += (" The \"connected\" notification needs payloads/notify.elf, which is missing "
+                     "here - it will be skipped.")
+            fg = Theme.warn
+        # the PKG manager uses the same payload server, to start the console's
+        # installer service - so say what it will do with what is in payloads/
+        installer_payload = pkg_manager.find_installer_payload(payloads_dir())
+        if installer_payload is None:
+            text += (" The PKG manager can start the console's installer service by itself too: "
+                     "drop an installer payload (rpi.bin, rpi.elf, installer.bin or installer.elf) "
+                     "into payloads/ and it will send it when port 12800 is dead.")
+        elif host:
+            text += (f" The PKG manager will start the console's installer service with "
+                     f"payloads/{installer_payload.name} when port 12800 is dead.")
+            if fg == Theme.muted:
+                fg = Theme.good
+        else:
+            text += (f" The PKG manager found payloads/{installer_payload.name} for the console's "
+                     "installer service, but it needs a payloader address above to send it.")
+            fg = Theme.warn
+        self.payload_result.configure(text=text, fg=fg)
 
     def _copy_host_to_payloader(self) -> None:
         host = str(self.vars["host"].get() or "").strip()
@@ -4131,6 +4307,7 @@ class Ps4ManagerApp(tk.Tk):
         self.ftp: Optional[Ps4Ftp] = None
         # GoldHEN's payload server, when an address is saved for it (see Config)
         self.payloader: Optional[Payloader] = None
+        self.notify_inflight = False     # one "connected" notification at a time
         self.ini = PluginsIni()
         self.ini_remote = True
         self.local_path: Optional[Path] = None
@@ -4302,7 +4479,7 @@ class Ps4ManagerApp(tk.Tk):
         the plugin tool and the settings, where it is a full page of its own.
         """
         strip = tk.Frame(parent, bg=Theme.bg)
-        self.tab_strips.append(strip)      # so the layout can be checked (see the tests)
+        self.tab_strips.append(strip)      # so the layout can be checked (the local test suite does)
         for key, label in (("plugins", "Plugins"), ("files", "Plugin files")):
             button = CButton(strip, label, command=lambda k=key: self.show_view(k),
                              variant="nav", bg=Theme.bg, height=30, width=112)
@@ -4486,6 +4663,40 @@ class Ps4ManagerApp(tk.Tk):
         else:
             self.pay_pill.set("Payload off", Theme.muted)
 
+    def notify_console_async(self, config: Optional[Config] = None) -> None:
+        """Pop the "connected" notification on the console, off the UI thread.
+
+        Fire and forget: it runs next to the FTP session, and BinLoader being off
+        (or the payload being missing) only shows up as one line in the log.
+
+        Only one runs at a time. GoldHEN's BinLoader handles a single connection,
+        so two connects in quick succession (startup auto-connect, then Connect)
+        would make the second one fail on a broken pipe after the first had
+        already shown its notification.
+        """
+        config = config or self.config
+        if self.notify_inflight:
+            self.log("A notification is already on its way to the PS4 - not sending a second one.")
+            return
+        self.notify_inflight = True
+
+        def work() -> Tuple[bool, str]:
+            # bg_log, not self.log: Tk may only be touched from the UI thread
+            return send_connect_notification(config, logger=self.bg_log)
+
+        def done(result: Tuple[bool, str]) -> None:
+            # The log only, on purpose: the status line belongs to the connection
+            # itself - and to what the payload server had to say about it.
+            self.notify_inflight = False
+            _shown, message = result
+            self.log(message)
+
+        def failed(exc: BaseException) -> None:
+            self.notify_inflight = False
+            self.log(f"The notification payload could not be sent: {exc}")
+
+        self.worker.submit(work, done, failed, name="notify")
+
     def connect_async(self, load: bool = True, announce: bool = True) -> None:
         if not self.config.host:
             self.show_view("settings")
@@ -4535,6 +4746,8 @@ class Ps4ManagerApp(tk.Tk):
             else:
                 self.set_status(f"Connected to {config.host}.", "good")
             self.refresh_payloader_pill()
+            if config.notify_on_connect:
+                self.notify_console_async(config)
             if load:
                 self.load_async()
 

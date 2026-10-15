@@ -5,6 +5,11 @@ title_cache.json
 plugins.ini
 backups/
 
+# The test suites stay local on purpose: the app needs neither to run, so they
+# are not published. (They still run normally here - git just ignores them.)
+test_ps4_manager.py
+test_live_ps4.py
+
 # Python bytecode and caches
 __pycache__/
 *.py[cod]

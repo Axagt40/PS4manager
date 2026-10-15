@@ -41,6 +41,7 @@ import secrets
 import socket
 import socketserver
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,6 +62,15 @@ DEFAULT_SERVE_PORT = 9898
 # in the homebrew stores under title id FLTZ00003.
 RPI_STORE_URL = "https://pkg-zone.com/details/FLTZ00003"
 RPI_SOURCE_URL = "https://github.com/flatz/ps4_remote_pkg_installer"
+
+# The service can also be started without that homebrew app: the PC tools in the
+# scene push a small payload through GoldHEN's BinLoader, which leaves the same
+# API listening on 12800. This app ships no third-party payload - instead it uses
+# one the user drops into payloads/ (any of these names) and starts the service
+# with it, on its own, whenever it finds the port dead.
+INSTALLER_PAYLOAD_NAMES = ("rpi.bin", "rpi.elf", "installer.bin", "installer.elf")
+INSTALLER_START_WAIT = 20.0     # how long the console gets to open the port
+INSTALLER_POLL = 0.5            # how often to look while waiting
 
 # The console writes hex literals (0x...) into its JSON replies, which is not
 # valid JSON - turn them into plain numbers before parsing.
@@ -102,6 +112,37 @@ def tcp_reachable(host: str, port: int, timeout: float = 2.0) -> bool:
             return True
     except OSError:
         return False
+
+
+def find_installer_payload(directory: Path) -> Optional[Path]:
+    """The installer payload the user left in payloads/, if there is one.
+
+    First match of :data:`INSTALLER_PAYLOAD_NAMES` wins. A raw ``.bin`` and an
+    ELF are both fine: GoldHEN's BinLoader decides from the bytes which it got.
+    """
+    for name in INSTALLER_PAYLOAD_NAMES:
+        candidate = Path(directory) / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def wait_for_service(probe: Callable[[], bool], timeout: float = INSTALLER_START_WAIT,
+                     interval: float = INSTALLER_POLL,
+                     sleep: Callable[[float], None] = time.sleep,
+                     clock: Callable[[], float] = time.monotonic) -> bool:
+    """Poll ``probe`` until it answers true or the time runs out.
+
+    ``sleep`` and ``clock`` are parameters so tests can run the whole wait
+    without spending real time on it.
+    """
+    deadline = clock() + max(0.0, float(timeout))
+    while True:
+        if probe():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(interval)
 
 
 def looks_like_manifest(url: str) -> bool:
@@ -349,6 +390,56 @@ class RemoteInstaller:
         exists = str(reply.get("exists", "")).lower() == "true"
         size = reply.get("size")
         return exists, (int(size) if size is not None else None)
+
+
+def ensure_installer_running(installer: "RemoteInstaller",
+                             payload: Optional[Path] = None,
+                             push: Optional[Callable[[Path], str]] = None,
+                             wait: float = INSTALLER_START_WAIT,
+                             logger: Optional[Callable[[str], None]] = None
+                             ) -> Tuple[bool, str]:
+    """Make sure the console's installer service answers, starting it if we can.
+
+    Three steps, each one only when the step before it came up empty: ask the
+    service, push the installer payload through GoldHEN's BinLoader, then wait
+    for the service to answer.  Returns ``(ready, message)`` and never raises -
+    a console that stays silent is reported, not thrown: the caller decides what
+    to say instead, and every step is one line in the log.
+
+    ``payload=None`` means "no payload to start it with" (nothing was dropped
+    into payloads/, or it was already tried this session) and ``push`` is
+    whatever sends one - the app hands in its BinLoader client, tests hand in a
+    lambda, and a payload that will not start the service on this console is
+    reported the same way as BinLoader being off.
+    """
+    def log(message: str) -> None:
+        if logger:
+            try:
+                logger(message)
+            except Exception:
+                pass
+
+    where = f"{installer.host}:{installer.port}"
+    if installer.probe():
+        return True, f"The installer service is already running on {where}."
+    if payload is None or push is None:
+        return False, (f"Nothing answers on {where}, and there is no installer payload to start it "
+                       f"with (payloads/ has none of {', '.join(INSTALLER_PAYLOAD_NAMES)}).")
+
+    log(f"{where} is dead - sending {Path(payload).name} through the payload server.")
+    try:
+        reply = push(Path(payload))
+    except Exception as exc:      # BinLoader off, payload refused, network hiccup
+        return False, (f"Nothing answers on {where}, and the installer payload could not be sent: "
+                       f"{' '.join(str(exc).split())}")
+    if reply:
+        log(f"The payload server said: {' '.join(str(reply).split())[:200]}")
+
+    log(f"Waiting for the installer service on {where} ...")
+    if wait_for_service(installer.probe, timeout=wait):
+        return True, f"The installer payload started the service on {where} ({Path(payload).name})."
+    return False, (f"{Path(payload).name} was sent, but nothing is listening on {where} yet - on some "
+                   "GoldHEN builds a payload sent through BinLoader does not start.")
 
 
 def copied_everything(total: int, transferred: int, copying: float, got_everything: bool) -> bool:

@@ -14,9 +14,9 @@ python3 ps4_manager.py      # start the app
 ```
 
 Everything the app writes (`ps4_manager_config.json`, `backups/`, `title_cache.json` and the
-local `plugins.ini` copy) stays next to the script and is ignored by git; the tests live here
-too. The `PS4-Manager.sh` shortcut in the parent folder is only a local launcher for the same
-command and is not part of this repository.
+local `plugins.ini` copy) stays next to the script and is ignored by git, and so are the two test
+suites, which are kept locally and are not published. The `PS4-Manager.sh` shortcut in the parent
+folder is only a local launcher for the same command and is not part of this repository.
 
 It remembers your PS4's address, connects on startup and shows every plugin from
 `/data/GoldHEN/plugins.ini` grouped into **Default (every game)** and one group per title id
@@ -58,9 +58,16 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 - **Installed on the PS4** lists the console's titles (system apps hidden, names from your title
   cache) and can **uninstall** one without touching the console.
 - Installing and uninstalling need one small homebrew service on the console — *Remote Package
-  Installer*, listening on port 12800. The page checks for it automatically and explains the
-  one-time setup when it is missing (*How to set it up*). Sending and deleting files only needs
-  GoldHEN's FTP, so that half works with no extra setup at all.
+  Installer*, listening on port 12800. The page checks for it automatically, starts it for you when
+  it can (next bullet) and otherwise explains the one-time setup (*How to set it up*). Sending and
+  deleting files only needs GoldHEN's FTP, so that half works with no extra setup at all.
+- **Automatic installer start**: drop an installer payload into `payloads/` — `rpi.bin`, `rpi.elf`,
+  `installer.bin` or `installer.elf`, i.e. one of the payloads the PC tools in the scene push
+  through GoldHEN's BinLoader — and the PKG manager sends it by itself the first time it finds port
+  12800 dead, waits for the service to answer and then carries on with the install, no extra click
+  and no trip to the setup notes. The app bundles **no** third-party payload, so that file has to be
+  one you put there yourself; with no such file nothing is sent and the page keeps pointing at the
+  one-time setup. It is sent once per session at most, because BinLoader takes a single connection.
 
 **Safe by default**
 - Automatic local backup of `plugins.ini` before every upload (including a `-before` copy),
@@ -92,11 +99,26 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 - Leave the address empty and the manager never opens the port. *Use the PS4 address above* copies
   the console's IP, *Test payload server* reports what answered and probes what is typed right now,
   even before saving.
-- The app ships **no payload** of its own. `Payloader` (in `ps4_manager.py`) can push a payload file
-  you supply — that is the hook the next features use, rather than bundling somebody's binary.
-- GoldHEN's BinLoader is marked *experimental* and on some builds stops listening after a single
-  connection: if the pill reads *Payload no reply* while GoldHEN is running, toggle BinLoader on the
-  console again.
+- **“PS4 Manager connected” on the console** — *off by default; switch it on in the Payload server
+  card.* The app ships **one small payload of its own** (`payloads/notify.elf`, source and makefile
+  in `payloads/notify/`) and, with the switch on, pushes it through BinLoader once after a
+  successful connect: it shows the notification, writes nothing to the console and returns. A PS4
+  has no notification API you can reach over the network, so a payload is the only way to draw
+  one — and that is also its catch. It uses BinLoader's single connection, and on some GoldHEN
+  builds a notification sent by a payload **never renders on screen**: there the loader's own
+  “Payload received” line is what you see, and the app's log says exactly what happened (verified
+  on such a build with this payload *and* with the payload SDK's own reference sample). To use your
+  own words, rebuild it — see `payloads/README.md`.
+- The same route is what starts the PKG manager's console-side installer: an installer payload in
+  `payloads/` (see the PKG manager section) is pushed through BinLoader by itself when port 12800 is
+  dead. `Payloader` (in `ps4_manager.py`) can also push **any** payload file you supply — that is the
+  hook for your own payloads, and the app never bundles somebody else's binary.
+- *Payload no reply* means nothing accepted a connection on the payload ports - the console-side
+  server is the missing half, not the app. In GoldHEN's menu open **Settings -> Servers** and switch
+  **BinLoader** on (it shows its port, `9090` unless you changed it); recent builds offer *ELF and
+  BIN, over TCP and HTTP POST*. Merely visiting that page is not enough, the setting has to be
+  enabled - and GoldHEN's BinLoader is marked *experimental*: on some builds it stops listening
+  after a single connection, so toggle it again if it worked once and then stopped.
 
 **Comforts**
 - Dark, minimal flat theme built with the standard library (no Qt, no pip).
@@ -153,29 +175,18 @@ not writable).
 
 ## Tests
 
-```bash
-# offline: parsers, plugins.ini round-trips, SFO, config (no console needed)
-python3 -m unittest test_ps4_manager.py
+The two test suites (`test_ps4_manager.py` for the offline half, `test_live_ps4.py` against a real
+console) are deliberately **not part of this repository** — the app runs without them — and are
+kept next to the app on the machine it was developed on. Nothing in `ps4_manager.py` or
+`pkg_manager.py` imports them.
 
-# against a real console (skipped unless PS4_HOST is set)
-PS4_HOST=192.168.1.50 python3 -m unittest -v test_live_ps4.py
+The app carries its own sanity check instead, which needs nothing but Python:
+
+```bash
+python3 ps4_manager.py --selftest     # builds the whole UI once and exits
 ```
 
-The PKG manager tests never need a console: they start the real HTTP server for a real `.pkg` file
-and let a stand-in installer service fetch it the way the PS4 does (a ranged read of the package
-header first), so the URL, the transfer and the byte count are all covered. The stand-in also
-answers with the console's own quirky JSON — hex literals such as `"size": 0x40000000` — which is
-what the client has to cope with.
-
-The live tests only touch a scratch folder (`/data/GoldHEN/_ps4manager_selftest`) that they
-create and remove, and they assert that `plugins.ini` and the plugins folder are untouched.
-`python3 ps4_manager.py --selftest` builds the whole UI once and exits — handy for a quick
-sanity check after editing.
-
-**The tests never show a window.** Both suites build the real Tk UI and then `withdraw()` it, so
-running them does not pop anything up over whatever you are doing. (If you *do* want to watch the
-UI being driven, use a throwaway virtual display, which needs no code change:
-`xvfb-run -a python3 -m unittest test_live_ps4.py` - screenshots taken inside it land in `/tmp`.)
+Run it after editing to confirm the window still comes up; it shows nothing on screen.
 
 ## Notes / troubleshooting
 
@@ -187,10 +198,18 @@ UI being driven, use a throwaway virtual display, which needs no code change:
   `550`); game names fall back to the title id and nothing else breaks.
 - Big bogus sizes: GoldHEN's FTP reports nonsense sizes for a few very large files — cosmetic only.
 - *“Installer not running” in the PKG manager* — the console-side service on port 12800 is not up.
-  Press **How to set it up** there: install the *Remote Package Installer* homebrew once
-  (title id `FLTZ00003`, a store build — flatz's GitHub has the source and building it needs the
-  private PS4 SDK) and start it before a transfer. Sending/deleting `.pkg` files on the console
-  keeps working without it.
+  If you left an installer payload in `payloads/` the manager already sent it, and the log says
+  whether BinLoader accepted it (see the payload-server notes above); otherwise press **How to set
+  it up** there: install the *Remote Package Installer* homebrew once (title id `FLTZ00003`, a store
+  build — flatz's GitHub has the source and building it needs the private PS4 SDK) and start it
+  before a transfer. Sending/deleting `.pkg` files on the console keeps working without it.
+- *No “PS4 Manager connected” notification on the console* — first, that switch is **off by
+  default**; turn it on in the Payload server card. It also needs GoldHEN's BinLoader (the payload
+  server pill says whether that is up), and the log names the reason when it cannot send, e.g.
+  *Notification skipped: …/payloads/notify.elf is missing*. If the log says the payload **was**
+  sent and GoldHEN reports the payload as launched but nothing appears, that is a loader-side
+  limitation of that build — a payload-sent notification is not rendered there, and no payload can
+  change that (the SDK's own reference sample behaves the same way).
 - *The console never starts downloading* — the PS4 has to reach your PC on the port shown in the
   PKG manager.
   If a firewall is up, allow that port (`sudo ufw allow 9898/tcp`). One transfer at a time: the
