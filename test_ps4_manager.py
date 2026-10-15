@@ -11,14 +11,21 @@ themselves when there is no display.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
+import socket
+import socketserver
 import struct
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
+import pkg_manager as pm
 import ps4_manager as m
 
 # The saved-server tests build real Tk widgets; they skip themselves when there is
@@ -414,6 +421,502 @@ class TestSavedServerFlow(unittest.TestCase):
         app.on_close()                      # no Save button pressed
         self.assertTrue(Path(m.CONFIG_FILE).exists())
         self.assertEqual(self.stored()["host"], self.HOST)
+
+
+# ---------------------------------------------------------------------------
+# PKG manager - parsing/back-end (no PS4, no console service needed)
+# ---------------------------------------------------------------------------
+
+
+class TestPkgHelpers(unittest.TestCase):
+    def test_split_package_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "game.pkg").write_bytes(b"merged")
+            (folder / "split_0.pkg").write_bytes(b"a")
+            (folder / "split_1.pkg").write_bytes(b"b")
+            # a merged package is sent on its own
+            self.assertEqual(pm.split_package_parts(folder / "game.pkg"), [folder / "game.pkg"])
+            # pieces are found and sent in numeric order
+            self.assertEqual(pm.split_package_parts(folder / "split_1.pkg"),
+                             [folder / "split_0.pkg", folder / "split_1.pkg"])
+            # a gap in the numbering is not a complete package - send just the file
+            (folder / "split_10.pkg").write_bytes(b"c")
+            self.assertEqual(pm.split_package_parts(folder / "split_0.pkg"), [folder / "split_0.pkg"])
+
+    def test_title_id_from_name(self) -> None:
+        self.assertEqual(pm.title_id_from_name("UP0001-CUSA12345_00-EXAMPLE0000000.pkg"), "CUSA12345")
+        self.assertEqual(pm.title_id_from_name("up0001-cusa12345_00-x.pkg"), "CUSA12345")
+        self.assertEqual(pm.title_id_from_name("CUSA12345.pkg"), "CUSA12345")
+        self.assertIsNone(pm.title_id_from_name("some-game-v2.pkg"))
+
+    def test_looks_like_manifest(self) -> None:
+        self.assertTrue(pm.looks_like_manifest("http://host/dir/MANIFEST.JSON"))
+        self.assertTrue(pm.looks_like_manifest("https://gs2.example/app.json?token=abc"))
+        self.assertFalse(pm.looks_like_manifest("http://host/dir/game.pkg"))
+
+    def test_pkg_file_filter(self) -> None:
+        names = ("a.pkg", "b.PKG", "c.pkg.part", "d.pkg.resume", "readme.txt", "games")
+        entries = [m.RemoteEntry(name=n, path="/data/pkg/" + n, is_dir=False) for n in names]
+        self.assertEqual([e.name for e in pm.pkg_entries(iter(entries))],
+                         ["a.pkg", "b.PKG", "c.pkg.part", "d.pkg.resume"])
+
+    def test_tcp_reachable(self) -> None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        try:
+            self.assertTrue(pm.tcp_reachable("127.0.0.1", listener.getsockname()[1], timeout=2))
+        finally:
+            listener.close()
+        self.assertFalse(pm.tcp_reachable("127.0.0.1", 1, timeout=0.5))
+
+
+class TestPkgLocalServer(unittest.TestCase):
+    """The console downloads the package from this server, so it has to behave
+    exactly like a file host: full GET, ranged GET (the installer reads the
+    package header with one), HEAD, and nothing else."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        # a space in the name on purpose - the URL must not need escaping
+        self.path = Path(self._tmp.name) / "an example package.pkg"
+        self.data = (bytes(range(256)) * 512) + b"tail"
+        self.path.write_bytes(self.data)
+        self.server = pm.LocalPkgServer([self.path], "127.0.0.1", port=0, allow_from="127.0.0.1")
+        self.server.start()
+        self.url = self.server.url_for(self.path)
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        self._tmp.cleanup()
+
+    def fetch(self, url: str, headers=None, method: str = "GET"):
+        request = urllib.request.Request(url, headers=headers or {}, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, dict(exc.headers), exc.read()
+
+    def test_url_is_token_scoped_and_space_free(self) -> None:
+        self.assertTrue(self.url.startswith("http://127.0.0.1:"))
+        self.assertNotIn(" ", self.url)
+        self.assertIn("/%s/" % self.server.token, self.url)
+        self.assertEqual(self.server.urls(), [self.url])
+
+    def test_full_download(self) -> None:
+        status, headers, body = self.fetch(self.url)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.data)
+        self.assertEqual(headers.get("Content-Length"), str(len(self.data)))
+        self.assertEqual(headers.get("Accept-Ranges"), "bytes")
+        self.assertGreaterEqual(self.server.served_total(), len(self.data))
+        self.assertEqual(self.server.expected_total(), len(self.data))
+
+    def test_ranged_download_that_the_installer_needs(self) -> None:
+        status, headers, body = self.fetch(self.url, {"Range": "bytes=1000-1099"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.data[1000:1100])
+        self.assertEqual(headers.get("Content-Range"), f"bytes 1000-1099/{len(self.data)}")
+        status, _headers, tail = self.fetch(self.url, {"Range": f"bytes={len(self.data) - 10}-"})
+        self.assertEqual(status, 206)
+        self.assertEqual(tail, self.data[-10:])
+
+    def test_head(self) -> None:
+        status, headers, body = self.fetch(self.url, method="HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertEqual(headers.get("Content-Length"), str(len(self.data)))
+
+    def test_unknown_path_is_404(self) -> None:
+        status, _headers, _body = self.fetch("http://127.0.0.1:%d/not-a-package.pkg" % self.server.port)
+        self.assertEqual(status, 404)
+
+    def test_other_hosts_are_refused(self) -> None:
+        other = pm.LocalPkgServer([self.path], "127.0.0.1", port=0, allow_from="10.99.99.99")
+        other.start()
+        try:
+            status, _headers, _body = self.fetch(other.url_for(self.path))
+            self.assertEqual(status, 403)
+        finally:
+            other.stop()
+
+    def test_stop_closes_the_port(self) -> None:
+        self.server.stop()
+        self.assertFalse(self.server.running)
+        with self.assertRaises(urllib.error.URLError):
+            self.fetch(self.url)
+
+
+class MockInstaller:
+    """A stand-in for Remote Package Installer on port 12800.
+
+    It answers with the raw strings the console really sends - including the
+    0x... hex literals, which are not valid JSON and have to be cleaned up by
+    the client before parsing.  With ``download=True`` it also behaves like the
+    console's downloader: it reads the package header with a ranged GET first,
+    then fetches the whole file from the URL it was handed.
+    """
+
+    def __init__(self, download: bool = False) -> None:
+        self.requests: list = []
+        self.download = download
+        self.downloaded: bytes | None = None
+        self.range_requested = False
+        self.download_error = ""
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server naming
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length).decode("utf-8") if length else ""
+                try:
+                    body = json.loads(raw or "{}")
+                except ValueError:
+                    body = {}
+                owner.requests.append((self.path, body))
+                payload = owner.reply_for(self.path, body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        class Server(http.server.ThreadingHTTPServer):
+            # no getfqdn() while binding: this is a test, not a DNS exercise
+            def server_bind(self_inner) -> None:
+                socketserver.TCPServer.server_bind(self_inner)
+                self_inner.server_name = "mock-console"
+                self_inner.server_port = self_inner.server_address[1]
+
+        self.httpd = Server(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def start_download(self, url: str) -> None:
+        """What the console's bgft downloader does, on a thread of its own."""
+        def run() -> None:
+            try:
+                header = urllib.request.Request(url, headers={"Range": "bytes=0-1023"})
+                with urllib.request.urlopen(header, timeout=15) as response:
+                    self.range_requested = response.status == 206
+                with urllib.request.urlopen(url, timeout=30) as response:
+                    self.downloaded = response.read()
+            except Exception as exc:  # pragma: no cover - the test asserts on the result
+                self.download_error = repr(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def reply_for(self, path: str, body: dict) -> str:
+        if path == "/api/is_exists":
+            if body.get("title_id") == "CUSA11111":
+                # exactly how the console writes it: a hex literal
+                return '{"status":"success","exists":"true","size":0x40000000}'
+            return '{"status":"success","exists":"false"}'
+        if path == "/api/install":
+            urls = list(body.get("packages") or []) + [body.get("url") or ""]
+            if any("bad" in url for url in urls):
+                return '{"status":"error","error":0x8002000b}'
+            if self.download and body.get("packages"):
+                self.start_download(body["packages"][0])
+            return '{"status":"success","task_id":7,"title":"Example Game"}'
+        if path == "/api/get_task_progress":
+            task = body.get("task_id")
+            if self.download and task == 7:
+                if self.downloaded is None:
+                    return '{"error":0,"preparing_percent":100,"length_total":0,"transferred_total":0,"local_copy_percent":0}'
+                return '{"error":0,"preparing_percent":100,"length_total":0x10,"transferred_total":0x10,"local_copy_percent":100}'
+            if task == 99:
+                return '{"error":0,"preparing_percent":100,"length_total":0x100,"transferred_total":0x100,"local_copy_percent":100}'
+            if task == 50:
+                return '{"error":0,"preparing_percent":100,"length_total":0x1000,"transferred_total":0x1000,"local_copy_percent":40}'
+            if task == 42:
+                return '{"error":0,"preparing_percent":42,"length_total":0,"transferred_total":0,"local_copy_percent":0}'
+            if task == 13:
+                return '{"error":0x8002000b}'
+            return '{"error":0,"preparing_percent":100,"length_total":0x1000,"transferred_total":0x800,"local_copy_percent":0}'
+        if path.startswith("/api/uninstall") or path.endswith("_task"):
+            return '{"status":"success"}'
+        return '{"status":"success"}'
+
+
+class TestPkgRemoteInstaller(unittest.TestCase):
+    def setUp(self) -> None:
+        self.mock = MockInstaller()
+        self.installer = pm.RemoteInstaller("127.0.0.1", port=self.mock.port, timeout=5)
+
+    def tearDown(self) -> None:
+        self.mock.close()
+
+    def test_probe_finds_the_service(self) -> None:
+        self.assertTrue(self.installer.probe())
+        self.assertEqual(self.mock.requests[-1][0], "/api/is_exists")
+
+    def test_probe_is_false_when_nothing_listens(self) -> None:
+        missing = pm.RemoteInstaller("127.0.0.1", port=1, timeout=1)
+        self.assertFalse(missing.probe())
+        with self.assertRaises(pm.InstallerUnavailable):
+            missing.install_direct(["http://host/a.pkg"])
+
+    def test_install_direct_sends_every_piece_in_order(self) -> None:
+        urls = ["http://192.168.1.50:9898/tok/aa.pkg", "http://192.168.1.50:9898/tok/bb.pkg"]
+        task = self.installer.install_direct(urls)
+        self.assertEqual(task.task_id, 7)
+        self.assertEqual(task.title, "Example Game")
+        self.assertEqual(self.mock.requests[-1],
+                         ("/api/install", {"type": "direct", "packages": urls}))
+
+    def test_install_manifest_uses_the_reference_type(self) -> None:
+        manifest = "https://gs2.example/app.json"
+        self.installer.install_manifest(manifest)
+        self.assertEqual(self.mock.requests[-1],
+                         ("/api/install", {"type": "ref_pkg_url", "url": manifest}))
+
+    def test_a_refused_install_raises(self) -> None:
+        with self.assertRaises(pm.InstallerError) as caught:
+            self.installer.install_direct(["http://host/bad.pkg"])
+        self.assertIn("refused", str(caught.exception))
+
+    def test_progress_phases(self) -> None:
+        downloading = self.installer.progress(7)
+        self.assertEqual(downloading.state, "downloading")
+        self.assertAlmostEqual(downloading.percent, 50.0)
+        self.assertEqual((downloading.transferred, downloading.total), (0x800, 0x1000))
+        self.assertFalse(downloading.failed)
+
+        preparing = self.installer.progress(42)
+        self.assertEqual(preparing.state, "preparing")
+        self.assertAlmostEqual(preparing.percent, 42.0)
+
+        installing = self.installer.progress(50)
+        self.assertEqual(installing.state, "installing")
+        self.assertAlmostEqual(installing.percent, 40.0)
+
+        done = self.installer.progress(99)
+        self.assertEqual(done.state, "done")
+        self.assertTrue(done.done)
+        self.assertAlmostEqual(done.percent, 100.0)
+
+        failed = self.installer.progress(13)
+        self.assertTrue(failed.failed)
+        self.assertEqual(failed.state, "error")
+        self.assertIn("0x8002000b", failed.detail)
+
+    def test_is_exists_reads_the_hex_size(self) -> None:
+        self.assertEqual(self.installer.is_exists("CUSA11111"), (True, 0x40000000))
+        self.assertEqual(self.installer.is_exists("CUSA99999"), (False, None))
+
+    def test_uninstall_calls(self) -> None:
+        self.installer.uninstall("game", "CUSA12345")
+        self.assertEqual(self.mock.requests[-1], ("/api/uninstall_game", {"title_id": "CUSA12345"}))
+        self.installer.uninstall("patch", "CUSA12345")
+        self.assertEqual(self.mock.requests[-1], ("/api/uninstall_patch", {"title_id": "CUSA12345"}))
+        self.installer.uninstall("ac", "UP0001-CUSA12345_00-EXAMPLE0000")
+        self.assertEqual(self.mock.requests[-1],
+                         ("/api/uninstall_ac", {"content_id": "UP0001-CUSA12345_00-EXAMPLE0000"}))
+        with self.assertRaises(pm.InstallerError):
+            self.installer.uninstall("nonsense", "CUSA12345")
+
+    def test_task_control(self) -> None:
+        self.installer.task_action("stop", 7)
+        self.assertEqual(self.mock.requests[-1], ("/api/stop_task", {"task_id": 7}))
+        self.installer.task_action("resume", 7)
+        self.assertEqual(self.mock.requests[-1], ("/api/resume_task", {"task_id": 7}))
+
+
+@unittest.skipUnless(_tk_usable(), "needs tkinter + a display")
+class TestPkgManagerView(unittest.TestCase):
+    """The PKG manager tab inside the plugin tool."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_config_file = m.CONFIG_FILE
+        m.CONFIG_FILE = Path(self._tmp.name) / "ps4_manager_config.json"
+        self.app = m.Ps4ManagerApp(m.Config(host="192.168.1.50"))
+        self.app.geometry("1080x700+40+40")
+        self.app.withdraw()          # never flash a window over the desktop
+
+    def tearDown(self) -> None:
+        try:
+            self.app.worker.stop()
+            self.app.destroy()
+        except Exception:
+            pass
+        m.CONFIG_FILE = self._real_config_file
+        self._tmp.cleanup()
+
+    def test_tab_is_part_of_the_plugin_tool(self) -> None:
+        view = self.app.views["pkgs"]
+        self.assertIsInstance(view, m.PkgManagerView)
+        self.app.show_view("pkgs")
+        self.assertEqual(self.app.current_view, "pkgs")
+        # the sidebar keeps the plugin tool lit for every tab inside it
+        self.assertTrue(self.app.nav_buttons["plugins"]._active)
+        self.assertTrue(any(key == "pkgs" for key, _button in self.app.tool_tabs))
+
+    def test_defaults_and_helpers(self) -> None:
+        view = self.app.views["pkgs"]
+        self.assertEqual(view.pkg_dir(), "/data/pkg")
+        self.assertEqual(view.console_host(), "192.168.1.50")
+        installer = pm.RemoteInstaller("192.168.1.50")
+        self.assertEqual(installer.port, 12800)
+
+    def test_pkg_dir_roundtrips_through_the_config(self) -> None:
+        config = m.Config(host="192.168.1.50", pkg_dir="/data/my pkgs")
+        path = Path(self._tmp.name) / "roundtrip.json"
+        config.save(path)
+        self.assertEqual(m.Config.load(path).pkg_dir, "/data/my pkgs")
+        self.assertEqual(m.Config.load(Path(self._tmp.name) / "missing.json").pkg_dir, "/data/pkg")
+
+    def test_a_bad_link_is_refused_before_touching_the_console(self) -> None:
+        view = self.app.views["pkgs"]
+        view.var_url.set("definitely not a link")
+        view.install_from_link()
+        self.assertIn("http", self.app.status_label.cget("text"))
+        view.var_url.set("")
+        view.install_from_link()
+        self.assertIn("link", self.app.status_label.cget("text"))
+
+    def test_install_without_a_console_address_explains_itself(self) -> None:
+        self.app.config.host = ""
+        view = self.app.views["pkgs"]
+        view.var_url.set("http://example.com/game.pkg")
+        view.install_from_link()
+        self.assertIn("Connect", self.app.status_label.cget("text"))
+
+    def test_shutdown_is_safe_when_nothing_is_running(self) -> None:
+        self.app.views["pkgs"].shutdown()
+        self.app.on_close()
+
+
+@unittest.skipUnless(_tk_usable(), "needs tkinter + a display")
+class TestPkgInstallFlow(unittest.TestCase):
+    """The whole install path, with only the console itself faked.
+
+    The view starts its real HTTP server for a real .pkg file, the mock console
+    fetches that URL the way the PS4 downloader does (ranged header read, then
+    the file), and the view polls the task until it reports success.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_config_file = m.CONFIG_FILE
+        m.CONFIG_FILE = Path(self._tmp.name) / "cfg.json"
+        self.pkg = Path(self._tmp.name) / "an example_0.pkg"
+        self.pkg.write_bytes(bytes(range(256)) * 1200)      # 300 KB
+        self.mock = MockInstaller(download=True)
+        self._real_installer = pm.RemoteInstaller
+        mock_port = self.mock.port
+        # the view builds RemoteInstaller(host) with the real port default; send
+        # it to the mock instead
+        pm.RemoteInstaller = lambda host, port=None, **kw: self._real_installer(
+            host, port=mock_port if port is None else port, **kw)
+        # no console FTP in these tests: the point is the install path
+        self.app = m.Ps4ManagerApp(m.Config(host="127.0.0.1", auto_connect=False))
+        self.app.geometry("1080x700+40+40")
+        self.app.withdraw()
+        # the app writes its own status line 120 ms after it is built; let that
+        # finish so the assertions below see the status this test causes
+        self.pump(0.4)
+
+    def tearDown(self) -> None:
+        pm.RemoteInstaller = self._real_installer
+        try:
+            self.app.views["pkgs"].shutdown()
+            self.app.worker.stop()
+            self.app.destroy()
+        except Exception:
+            pass
+        self.mock.close()
+        m.CONFIG_FILE = self._real_config_file
+        self._tmp.cleanup()
+
+    def pump(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end:
+            self.app.update()
+            time.sleep(0.03)
+
+    def test_local_package_reaches_the_console_and_installs(self) -> None:
+        view = self.app.views["pkgs"]
+        view.local_pkg = self.pkg
+        view.install_from_pc()
+        self.pump(2.0)
+
+        self.assertIsNotNone(view.task, "the install task was never tracked")
+        self.assertEqual(view.task.task_id, 7)
+        install_calls = [body for path, body in self.mock.requests if path == "/api/install"]
+        self.assertEqual(len(install_calls), 1)
+        urls = install_calls[0]["packages"]
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0].startswith("http://127.0.0.1:"), urls[0])
+        # the served URL really is fetched, and byte for byte the right file
+        self.assertEqual(self.mock.download_error, "")
+        self.assertEqual(self.mock.downloaded, self.pkg.read_bytes())  # 300 KB, byte for byte
+        self.assertTrue(self.mock.range_requested, "the console reads the header with a range request")
+
+        # then the progress poll walks the task to 'installed'
+        self.pump(5.0)
+        self.assertIsNone(view.task)
+        self.assertEqual(view.progress_label.cget("text"), "Installed.")
+        self.assertIn("installed", self.app.status_label.cget("text").lower())
+        self.assertAlmostEqual(float(view.progress["value"]), 100.0)
+        self.assertFalse(view.server is not None and view.server.running,
+                         "the HTTP server must stop once the install is done")
+
+    def test_install_from_a_link_uses_the_console_installer(self) -> None:
+        view = self.app.views["pkgs"]
+        view.var_url.set("http://files.example/UP0001-CUSA12345_00-EXAMPLE.pkg")
+        view.install_from_link()
+        self.pump(2.0)
+        install_calls = [body for path, body in self.mock.requests if path == "/api/install"]
+        self.assertEqual(len(install_calls), 1)
+        self.assertEqual(install_calls[0]["type"], "direct")
+        self.assertEqual(install_calls[0]["packages"],
+                         ["http://files.example/UP0001-CUSA12345_00-EXAMPLE.pkg"])
+        # nothing to serve: a link install must not open a local server
+        self.assertIsNone(view.server)
+        view.shutdown()
+
+    def test_uninstall_asks_the_console(self) -> None:
+        view = self.app.views["pkgs"]
+        view.installed_rows["app::CUSA12345"] = m.RemoteEntry(
+            name="CUSA12345", path="/user/appmeta/CUSA12345", is_dir=True)
+        original = m.messagebox.askyesno
+        m.messagebox.askyesno = lambda *a, **kw: True
+        try:
+            view.apps_tree.insert("", "end", iid="app::CUSA12345", text="CUSA12345")
+            view.apps_tree.selection_set("app::CUSA12345")
+            view.uninstall_selected()
+            self.pump(2.0)
+        finally:
+            m.messagebox.askyesno = original
+        uninstalls = [body for path, body in self.mock.requests if path == "/api/uninstall_game"]
+        self.assertEqual(uninstalls, [{"title_id": "CUSA12345"}])
+        self.assertIn("Uninstalled CUSA12345", self.app.status_label.cget("text"))
+        self.assertEqual(self.app.worker.busy, 0, "the busy indicator must be cleared")
+
+    def test_console_without_the_service_reports_it(self) -> None:
+        self.mock.close()                       # the console stops answering
+        view = self.app.views["pkgs"]
+        view.var_url.set("http://files.example/game.pkg")
+        view.install_from_link()
+        self.pump(1.0)
+        # the status line is shared with the rest of the app, so assert on the
+        # view's own state and on the (append-only) log
+        self.assertEqual(view.service_pill.label.cget("text"), "Installer not running")
+        self.assertIn("12800", self.app.log_text.get("1.0", "end"))
+        self.assertIsNone(view.server)
 
 
 if __name__ == "__main__":

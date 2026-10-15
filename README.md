@@ -1,8 +1,13 @@
 # PS4 Manager
 
-A small desktop app for a **jailbroken PS4 over GoldHEN's FTP server**. Right now it manages
-**plugins** (no FileZilla, no renaming `plugins.ini` to `.txt`, no manual editing) and browses the
-console's **files**; it is built to grow further PS4 tools, so the name stays general.
+A small desktop app for a **jailbroken PS4 over GoldHEN's FTP server**. It manages **plugins**
+(no FileZilla, no renaming `plugins.ini` to `.txt`, no manual editing), browses the console's
+**files**, and **installs, removes and moves packages** (`PKG manager`) — from a direct link or
+from a `.pkg` sitting on your PC. It is built to grow further PS4 tools, so the name stays
+general.
+
+The PKG manager's back end lives in `pkg_manager.py` next to the app (standard library only, no
+`pip install` there either).
 
 ```
 python3 ps4_manager.py      # start the app
@@ -39,6 +44,23 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 
 **Plugin files**
 - Browse, upload, download, delete, create folders — all over FTP.
+
+**PKG manager** (third tab of the plugin tool)
+- **Install from a link**: paste a `http(s)://` URL to a `.pkg` (or to a `.json` manifest) and the
+  PS4 downloads and installs it by itself.
+- **Install from this PC**: pick a `.pkg` on your PC and it is streamed to the console over HTTP
+  while it installs. Nothing has to be copied to the console first, and no menu on the PS4 is
+  touched. Split packages (`name_0.pkg`, `name_1.pkg`, …) are sent as one package, in order.
+- Live progress for every phase the console reports — *preparing*, *downloading* (with MB
+  counters) and *installing* — plus a **Stop** button, and the task id is logged.
+- **Send a .pkg …** / **Delete from PS4**: move package files onto the console over FTP and remove
+  them again (default folder `/data/pkg`, changeable in `ps4_manager_config.json` as `pkg_dir`).
+- **Installed on the PS4** lists the console's titles (system apps hidden, names from your title
+  cache) and can **uninstall** one without touching the console.
+- Installing and uninstalling need one small homebrew service on the console — *Remote Package
+  Installer*, listening on port 12800. The tab checks for it automatically and explains the
+  one-time setup when it is missing (*How to set it up*). Sending and deleting files only needs
+  GoldHEN's FTP, so that half works with no extra setup at all.
 
 **Safe by default**
 - Automatic local backup of `plugins.ini` before every upload (including a `-before` copy),
@@ -123,6 +145,12 @@ python3 -m unittest test_ps4_manager.py
 PS4_HOST=192.168.1.50 python3 -m unittest -v test_live_ps4.py
 ```
 
+The PKG manager tests never need a console: they start the real HTTP server for a real `.pkg` file
+and let a stand-in installer service fetch it the way the PS4 does (a ranged read of the package
+header first), so the URL, the transfer and the byte count are all covered. The stand-in also
+answers with the console's own quirky JSON — hex literals such as `"size": 0x40000000` — which is
+what the client has to cope with.
+
 The live tests only touch a scratch folder (`/data/GoldHEN/_ps4manager_selftest`) that they
 create and remove, and they assert that `plugins.ini` and the plugins folder are untouched.
 `python3 ps4_manager.py --selftest` builds the whole UI once and exits — handy for a quick
@@ -142,3 +170,11 @@ UI being driven, use a throwaway virtual display, which needs no code change:
 - Console folders that contain images/`param.sfo` may not be readable over FTP (GoldHEN answers
   `550`); game names fall back to the title id and nothing else breaks.
 - Big bogus sizes: GoldHEN's FTP reports nonsense sizes for a few very large files — cosmetic only.
+- *“Installer not running” in the PKG manager* — the console-side service on port 12800 is not up.
+  Press **How to set it up** in that tab: install the *Remote Package Installer* homebrew once
+  (title id `FLTZ00003`, a store build — flatz's GitHub has the source and building it needs the
+  private PS4 SDK) and start it before a transfer. Sending/deleting `.pkg` files on the console
+  keeps working without it.
+- *The console never starts downloading* — the PS4 has to reach your PC on the port the tab shows.
+  If a firewall is up, allow that port (`sudo ufw allow 9898/tcp`). One transfer at a time: the
+  console's downloader queues the rest.

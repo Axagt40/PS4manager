@@ -44,6 +44,7 @@ import functools
 import io
 import json
 import os
+import pkg_manager
 import platform
 import queue
 import re
@@ -61,7 +62,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_PORT = 2121
 DEFAULT_INI = "/data/GoldHEN/plugins.ini"
 DEFAULT_PLUGINS_DIR = "/data/GoldHEN/plugins"
@@ -1033,6 +1034,7 @@ class Config:
     auto_connect: bool = True
     auto_apply: bool = True
     keep_backups: int = 25
+    pkg_dir: str = pkg_manager.DEFAULT_PKG_DIR
     window_geometry: str = ""
     recent_hosts: List[str] = field(default_factory=list)
 
@@ -2706,6 +2708,706 @@ class _TextPrompt(ModalDialog):
         CButton(footer, "Cancel", command=self.close, variant="ghost").pack(side="right", padx=(0, 8))
 
 
+PKG_SETUP_HELP = """\
+Nothing is listening on {host}:12800 - and that port is the only way to install a
+package on the console without touching the package installer in its menus.
+
+What has to run on the PS4
+  "Remote Package Installer" (by flatz, title id FLTZ00003). It is a tiny
+  homebrew app: it listens on 12800, takes a package URL from this PC and hands
+  the download to the PS4's own downloader, which installs the package and
+  shows the usual progress notification.
+
+  1. Get its .pkg from a homebrew store - "Copy link" below copies the PKG-Zone
+     page for it. flatz's GitHub carries the source only, and building it needs
+     the private PS4 SDK, so a store build is the practical route.
+  2. Install that one .pkg on the PS4, once - Itemzflow's PKG Installer or
+     GoldHEN's package installer can both do it without a PC.
+  3. Start "Remote Package Installer" from the home screen, and leave it in the
+     foreground until a transfer has actually started: the console suspends a
+     background app, and that stops the download.
+  4. Back here, press "Check console".
+
+Alternative - GoldHEN's payload server
+  Turn on BinLoader / the payload server in GoldHEN's settings (ports 9090,
+  9020, 9021) and use a PC tool that pushes its own installer payload; the
+  service it leaves running on 12800 is the same API this app speaks. This app
+  ships no third-party payload on purpose, so the app above is the one to use.
+
+Without that service the rest of this tab still works
+  "Send a .pkg ..." moves packages onto the console over FTP and deletes them
+  again, and the installed-titles list reads the console's own database - handy
+  together with the console's own installers (Itemzflow, FPKGi), or to keep a
+  package on the console for later.
+"""
+
+
+class PkgSetupDialog(ModalDialog):
+    """The one-time console-side setup, spelled out."""
+
+    def __init__(self, app, host: str) -> None:
+        super().__init__(app, "Console installer - setup", 660, 470)
+        self.app = app
+        self.host = host
+        self.grab_set()
+        tk.Label(self, text="One-time setup on the PS4", bg=Theme.bg, fg=Theme.text,
+                 font=Theme.font_h2).pack(anchor="w", padx=22, pady=(18, 8))
+        body = tk.Text(self, bg=Theme.surface, fg=Theme.text_dim, font=Theme.font_small,
+                       relief="flat", wrap="word", bd=0, highlightthickness=0)
+        body.pack(fill="both", expand=True, padx=22)
+        body.insert("1.0", PKG_SETUP_HELP.format(host=host or "your PS4"))
+        body.configure(state="disabled")
+        footer = tk.Frame(self, bg=Theme.bg)
+        footer.pack(fill="x", padx=22, pady=(14, 16))
+        CButton(footer, "Copy the download link", command=self._copy_link, bg=Theme.bg).pack(side="left")
+        CButton(footer, "Copy the source link", command=lambda: self._copy(pkg_manager.RPI_SOURCE_URL),
+                bg=Theme.bg).pack(side="left", padx=(8, 0))
+        CButton(footer, "Close", command=self.close, variant="primary", bg=Theme.bg).pack(side="right")
+
+    def _copy_link(self) -> None:
+        self._copy(pkg_manager.RPI_STORE_URL)
+
+    def _copy(self, link: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(link)
+        self.app.set_status("Remote Package Installer link copied to the clipboard.", "good")
+
+
+class PkgManagerView(tk.Frame):
+    """Install, remove and move .pkg files - the plugin tool's third tab.
+
+    Everything the console has to do is done by the console: it downloads the
+    package from this PC (direct link or a local file served over HTTP) and
+    installs it itself, so no package is ever copied to the console by hand and
+    no menu on the PS4 has to be touched.
+    """
+
+    POLL_MS = 1500
+
+    def __init__(self, app, master) -> None:
+        super().__init__(master, bg=Theme.bg)
+        self.app = app
+        self.server: Optional[pkg_manager.LocalPkgServer] = None
+        self.task: Optional[pkg_manager.InstallTask] = None
+        self.installer: Optional[pkg_manager.RemoteInstaller] = None
+        self.local_pkg: Optional[Path] = None
+        self._poll_id: Optional[str] = None
+        self._checked = False
+        self.console_rows: Dict[str, RemoteEntry] = {}
+        self.installed_rows: Dict[str, RemoteEntry] = {}
+
+        head = tk.Frame(self, bg=Theme.bg)
+        head.pack(fill="x", padx=24, pady=(20, 0))
+        left = tk.Frame(head, bg=Theme.bg)
+        left.pack(side="left")
+        tk.Label(left, text="PKG manager", bg=Theme.bg, fg=Theme.text,
+                 font=Theme.font_h1).pack(anchor="w")
+        self.subtitle = tk.Label(
+            left, text="Install a .pkg from a link or straight from this PC - the PS4 downloads it itself.",
+            bg=Theme.bg, fg=Theme.muted, font=Theme.font_small)
+        self.subtitle.pack(anchor="w", pady=(2, 0))
+        right = tk.Frame(head, bg=Theme.bg)
+        right.pack(side="right")
+        self.app.make_tool_tabs(right, "pkgs").pack(side="right", padx=(14, 0))
+        self.service_pill = StatusPill(right, bg=Theme.bg)
+        self.service_pill.pack(side="right")
+
+        body = VScrollFrame(self, bg=Theme.bg)
+        body.pack(fill="both", expand=True, padx=24, pady=(14, 14))
+        inner = body.inner
+
+        # -- console installer service -------------------------------------
+        service = self._card(inner, "Console installer",
+                             "Installing has to be done by the console. It needs one small homebrew "
+                             "service (port 12800) running - everything below is one-time setup.")
+        row = tk.Frame(service, bg=Theme.surface)
+        row.pack(fill="x", padx=14, pady=(0, 12))
+        self.service_label = tk.Label(row, text="Not checked yet.", bg=Theme.surface, fg=Theme.text_dim,
+                                      font=Theme.font_small, justify="left", anchor="w", wraplength=620)
+        self.service_label.pack(side="left", fill="x", expand=True)
+        CButton(row, "Check console", command=self.check_service, bg=Theme.surface, height=30).pack(side="left", padx=(8, 0))
+        CButton(row, "How to set it up", command=self.show_setup, bg=Theme.surface, height=30).pack(side="left", padx=(8, 0))
+
+        # -- install --------------------------------------------------------
+        install = self._card(inner, "Install a package",
+                             "A direct link is downloaded by the PS4 itself. A file on this PC is "
+                             "streamed to the console over HTTP while it installs - nothing is copied to "
+                             "the console over FTP first, and no menu on the PS4 is used.")
+        row = tk.Frame(install, bg=Theme.surface)
+        row.pack(fill="x", padx=14)
+        tk.Label(row, text="Direct link", bg=Theme.surface, fg=Theme.text_dim, font=Theme.font_small,
+                 width=12, anchor="w").pack(side="left")
+        self.var_url = tk.StringVar()
+        entry = make_entry(row, self.var_url, width=54, font=Theme.font_mono, bg=Theme.surface2)
+        entry.pack(side="left", fill="x", expand=True, ipady=4)
+        entry.bind("<Return>", lambda _e: self.install_from_link())
+        CButton(row, "Install link", command=self.install_from_link, variant="primary",
+                bg=Theme.surface, height=30).pack(side="left", padx=(8, 0))
+
+        row = tk.Frame(install, bg=Theme.surface)
+        row.pack(fill="x", padx=14, pady=(8, 0))
+        tk.Label(row, text="From this PC", bg=Theme.surface, fg=Theme.text_dim, font=Theme.font_small,
+                 width=12, anchor="w").pack(side="left")
+        self.local_label = tk.Label(row, text="no file chosen", bg=Theme.surface2, fg=Theme.muted,
+                                    font=Theme.font_mono, anchor="w", padx=8, pady=4)
+        self.local_label.pack(side="left", fill="x", expand=True)
+        CButton(row, "Choose ...", command=self.choose_local, bg=Theme.surface, height=30).pack(side="left", padx=(8, 0))
+        self.local_button = CButton(row, "Install from this PC", command=self.install_from_pc,
+                                    variant="primary", bg=Theme.surface, height=30)
+        self.local_button.pack(side="left", padx=(8, 0))
+
+        self.var_parts = tk.BooleanVar(value=True)
+        CCheck(install, "Send every piece when the package is split (name_0.pkg, name_1.pkg, ...)",
+               variable=self.var_parts, bg=Theme.surface).pack(anchor="w", padx=14, pady=(10, 6))
+
+        progress_row = tk.Frame(install, bg=Theme.surface)
+        progress_row.pack(fill="x", padx=14, pady=(0, 12))
+        self.progress = ttk.Progressbar(progress_row, mode="determinate", maximum=100, length=380,
+                                        style="PS4.Horizontal.TProgressbar")
+        self.progress.pack(side="left")
+        self.progress_label = tk.Label(progress_row, text="Idle.", bg=Theme.surface, fg=Theme.muted,
+                                       font=Theme.font_small, anchor="w")
+        self.progress_label.pack(side="left", padx=(12, 0))
+        self.stop_button = CButton(progress_row, "Stop", command=self.stop_install, variant="danger",
+                                   bg=Theme.surface, height=28)
+        self.stop_button.pack(side="right")
+        self.stop_button.set_enabled(False)
+
+        # -- package files on the console -----------------------------------
+        files = self._card(inner, "Packages on the PS4",
+                           "Files that live on the console, so a package can be installed later without "
+                           "the PC, or kept as a backup of what you sent.")
+        self.console_tree = self._tree(files, (("size", "Size", 110), ("where", "Folder", 240)))
+        row = tk.Frame(files, bg=Theme.surface)
+        row.pack(fill="x", padx=14, pady=(10, 12))
+        CButton(row, "Send a .pkg ...", command=self.send_pkgs_to_console, variant="primary",
+                bg=Theme.surface).pack(side="left")
+        CButton(row, "Delete from PS4", command=self.delete_console_pkgs, variant="danger",
+                bg=Theme.surface).pack(side="left", padx=(8, 0))
+        CButton(row, "Refresh", command=self.refresh_console_pkgs, bg=Theme.surface).pack(side="left", padx=(8, 0))
+        self.console_hint = tk.Label(row, text="", bg=Theme.surface, fg=Theme.muted, font=Theme.font_small)
+        self.console_hint.pack(side="right")
+
+        # -- installed titles -----------------------------------------------
+        apps = self._card(inner, "Installed on the PS4",
+                          "Uninstalling also goes through the console service, so it works without touch"
+                          "ing the console itself. Saved data stays unless the console removes it.")
+        self.apps_tree = self._tree(apps)
+        row = tk.Frame(apps, bg=Theme.surface)
+        row.pack(fill="x", padx=14, pady=(10, 12))
+        self.uninstall_button = CButton(row, "Uninstall selected", command=self.uninstall_selected,
+                                        variant="danger", bg=Theme.surface)
+        self.uninstall_button.pack(side="left")
+        CButton(row, "Refresh", command=self.refresh_installed, bg=Theme.surface).pack(side="left", padx=(8, 0))
+        self.apps_hint = tk.Label(row, text="", bg=Theme.surface, fg=Theme.muted, font=Theme.font_small)
+        self.apps_hint.pack(side="right")
+
+    # -- small builders -----------------------------------------------------
+    def _card(self, parent, title: str, hint: str = "") -> tk.Frame:
+        card = tk.Frame(parent, bg=Theme.surface, highlightthickness=1,
+                        highlightbackground=Theme.border)
+        card.pack(fill="x", pady=(0, 14))
+        tk.Label(card, text=title, bg=Theme.surface, fg=Theme.text,
+                 font=Theme.font_h2).pack(anchor="w", padx=14, pady=(12, 0))
+        if hint:
+            tk.Label(card, text=hint, bg=Theme.surface, fg=Theme.muted, font=Theme.font_small,
+                     justify="left", anchor="w", wraplength=880).pack(anchor="w", padx=14, pady=(3, 10))
+        return card
+
+    def _tree(self, parent, columns: Sequence[Tuple[str, str, int]] = ()) -> ttk.Treeview:
+        """A short, scrollable list. Extra columns are optional - with none this
+        is a plain name column."""
+        frame = tk.Frame(parent, bg=Theme.surface, height=170)
+        frame.pack(fill="x", padx=14)
+        frame.pack_propagate(False)
+        keys = tuple(c[0] for c in columns)
+        tree = ttk.Treeview(frame, columns=keys,
+                            show="tree headings" if keys else "tree",
+                            selectmode="extended", height=7)
+        tree.heading("#0", text="Name" if keys else "Title", anchor="w")
+        tree.column("#0", width=360, minwidth=200, stretch=True)
+        for key, label, width in columns:
+            tree.heading(key, text=label, anchor="w")
+            tree.column(key, width=width, minwidth=80, stretch=False)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scroll.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        tree.tag_configure("empty", foreground=Theme.muted)
+        tree.tag_configure("ok", foreground=Theme.text)
+        return tree
+
+    # -- helpers -----------------------------------------------------------
+    def console_host(self) -> str:
+        return (self.app.config.host or "").strip()
+
+    def pkg_dir(self) -> str:
+        return (self.app.config.pkg_dir or pkg_manager.DEFAULT_PKG_DIR).rstrip("/") or "/"
+
+    def bg_log(self, message: str) -> None:
+        """Log from a worker thread.
+
+        The HTTP client and the file server run on worker threads, and touching
+        a widget from one of those stalls for a second per call (Tkinter makes
+        the caller wait for the UI thread to reach its main loop).  Hop back to
+        the UI thread through the app's worker queue instead.
+        """
+        self.app.worker.post(self.app.log, message)
+
+    def make_installer(self) -> Optional[pkg_manager.RemoteInstaller]:
+        host = self.console_host()
+        if not host:
+            self.app.set_status("Connect to your PS4 first - the PKG manager needs its address.", "warn")
+            return None
+        return pkg_manager.RemoteInstaller(host, logger=self.bg_log)
+
+    def require_ftp(self):
+        if self.app.ftp is None:
+            self.app.set_status("Connect to your PS4 first.", "warn")
+            return None
+        return self.app.ftp
+
+    # -- what happens when the tab opens -----------------------------------
+    def on_shown(self) -> None:
+        if not self._checked:
+            self._checked = True
+            self.check_service(quiet=True)
+        if self.app.ftp is not None:
+            self.refresh_console_pkgs()
+            self.refresh_installed()
+
+    def shutdown(self) -> None:
+        self._cancel_poll()
+        self._stop_server()
+
+    # -- installer service -------------------------------------------------
+    def check_service(self, quiet: bool = False) -> None:
+        installer = self.make_installer()
+        if installer is None:
+            return
+        self.service_pill.set("Checking ...", Theme.warn)
+        self.service_label.configure(text="Looking for the installer service on "
+                                          f"{installer.host}:{installer.port} ...", fg=Theme.text_dim)
+
+        def work() -> bool:
+            return installer.probe()
+
+        def done(ready: bool) -> None:
+            self.installer = installer if ready else None
+            if ready:
+                self.service_pill.set("Installer ready", Theme.good)
+                self.service_label.configure(
+                    text=f"Remote Package Installer is running on {installer.host}:{installer.port} - "
+                         "packages can be installed and removed from here.", fg=Theme.text)
+                self.uninstall_button.set_enabled(True)
+                self.apps_hint.configure(text="")
+            else:
+                self.service_pill.set("Installer not running", Theme.warn)
+                self.service_label.configure(
+                    text=f"Nothing answers on {installer.host}:{installer.port}. Press \"How to set it up\" "
+                         "for the one-time install, then \"Check console\" again. Everything else on this "
+                         "tab (sending files, listing, deleting) works right now.", fg=Theme.warn)
+                self.uninstall_button.set_enabled(False)
+                self.apps_hint.configure(text="Uninstalling needs the installer service.")
+            if not quiet:
+                self.app.set_status("Console installer ready." if ready
+                                    else "No installer service on the console yet - see the setup notes.",
+                                    "good" if ready else "warn")
+
+        def failed(exc: BaseException) -> None:
+            self.service_pill.set("Installer not running", Theme.warn)
+            self.service_label.configure(text=f"Could not check the console: {exc}", fg=Theme.warn)
+
+        self.app.worker.submit(work, done, failed, name="pkg-probe")
+
+    def show_setup(self) -> None:
+        PkgSetupDialog(self.app, self.console_host()).show()
+
+    # -- installing ---------------------------------------------------------
+    def choose_local(self) -> None:
+        chosen = filedialog.askopenfilename(
+            parent=self, title="Choose a package to install on the PS4",
+            filetypes=[("PS4 packages", "*.pkg"), ("All files", "*.*")])
+        if not chosen:
+            return
+        self.local_pkg = Path(chosen)
+        self.show_local_file()
+
+    def show_local_file(self) -> None:
+        if self.local_pkg is None:
+            self.local_label.configure(text="no file chosen", fg=Theme.muted)
+            return
+        try:
+            size = self.local_pkg.stat().st_size
+        except OSError:
+            size = None
+        self.local_label.configure(text=f"{self.local_pkg.name}   ({fmt_size(size)})", fg=Theme.text)
+
+    def install_from_link(self) -> None:
+        url = (self.var_url.get() or "").strip()
+        if not url:
+            self.app.set_status("Paste a http(s) link to a .pkg (or a .json manifest) first.", "warn")
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            self.app.set_status("The link has to start with http:// or https://", "warn")
+            return
+        installer = self.make_installer()
+        if installer is None:
+            return
+        if not installer.probe():
+            self.warn_no_service()
+            return
+        self.installer = installer
+        self.app.begin_busy("Asking the PS4 to download the package ...")
+
+        def work() -> pkg_manager.InstallTask:
+            if pkg_manager.looks_like_manifest(url):
+                return installer.install_manifest(url)
+            return installer.install_direct([url])
+
+        def done(task: pkg_manager.InstallTask) -> None:
+            self.app.end_busy()
+            self.start_tracking(task, source=url)
+
+        def failed(exc: BaseException) -> None:
+            self.app.end_busy()
+            self.install_failed(exc)
+
+        self.app.worker.submit(work, done, failed, name="pkg-install-link")
+
+    def install_from_pc(self) -> None:
+        path = self.local_pkg
+        if path is None:
+            self.choose_local()
+            path = self.local_pkg
+            if path is None:
+                return
+        if not path.is_file():
+            self.app.set_status(f"{path} is no longer there.", "bad")
+            return
+        installer = self.make_installer()
+        if installer is None:
+            return
+        if not installer.probe():
+            self.warn_no_service()
+            return
+        host = installer.host
+        ip = pkg_manager.local_ip_for(host)
+        if not ip:
+            self.app.set_status("This PC has no network route to the console - is the LAN up?", "bad")
+            return
+        files = pkg_manager.split_package_parts(path) if self.var_parts.get() else [path]
+        server = pkg_manager.LocalPkgServer(files, ip, allow_from=host, logger=self.bg_log)
+        self.installer = installer
+        self.app.begin_busy(f"Streaming {path.name} to the PS4 ...")
+
+        def work() -> pkg_manager.InstallTask:
+            server.start()
+            urls = server.urls()
+            self.app.log("Serving " + ", ".join(urls))
+            return installer.install_direct(urls)
+
+        def done(task: pkg_manager.InstallTask) -> None:
+            self.app.end_busy()
+            self.server = server
+            self.start_tracking(task, source=f"{path.name} via {ip}:{server.port}")
+
+        def failed(exc: BaseException) -> None:
+            self.app.end_busy()
+            server.stop()
+            self.install_failed(exc)
+
+        self.app.worker.submit(work, done, failed, name="pkg-install-local")
+
+    def warn_no_service(self) -> None:
+        host = self.console_host()
+        self.service_pill.set("Installer not running", Theme.warn)
+        self.app.set_status(f"Nothing answers on {host}:{pkg_manager.RPI_PORT} - press "
+                            "\"How to set it up\" in the PKG manager for the one-time install.", "warn")
+
+    def install_failed(self, exc: BaseException) -> None:
+        self.app.set_status(f"Install failed: {exc}", "bad")
+        self.progress_label.configure(text="Failed.", fg=Theme.bad)
+        self.progress["value"] = 0
+        self.stop_button.set_enabled(False)
+
+    # -- tracking -----------------------------------------------------------
+    def start_tracking(self, task: pkg_manager.InstallTask, source: str = "") -> None:
+        self.task = task
+        self.progress["value"] = 0
+        self.progress_label.configure(text=f"Task {task.task_id} started ...", fg=Theme.text_dim)
+        self.stop_button.set_enabled(True)
+        title = task.title or "package"
+        self.app.set_status(f"Installing {title} - the PS4 is downloading it now.", "muted")
+        self.app.log(f"Install task {task.task_id} ({title}) from {source}")
+        self._schedule_poll()
+
+    def _schedule_poll(self, delay: Optional[int] = None) -> None:
+        self._cancel_poll()
+        self._poll_id = self.after(self.POLL_MS if delay is None else delay, self._poll)
+
+    def _cancel_poll(self) -> None:
+        if self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except Exception:
+                pass
+            self._poll_id = None
+
+    def _poll(self) -> None:
+        self._poll_id = None
+        installer, task = self.installer, self.task
+        if installer is None or task is None:
+            return
+
+        def work() -> pkg_manager.TaskProgress:
+            return installer.progress(task.task_id)
+
+        def done(state: pkg_manager.TaskProgress) -> None:
+            self.progress["value"] = max(0.0, min(100.0, state.percent))
+            self.progress_label.configure(text=state.detail or state.state, fg=Theme.text_dim)
+            if state.failed:
+                self.app.set_status(f"Install failed: {state.detail}", "bad")
+                self._finish_tracking()
+                return
+            if state.done:
+                name = task.title or "Package"
+                self.progress["value"] = 100
+                self.progress_label.configure(text="Installed.", fg=Theme.good)
+                self.app.set_status(f"{name} installed on the PS4.", "good")
+                self.app.log(f"Install task {task.task_id} finished: {name}")
+                self._finish_tracking()
+                self.refresh_installed(quiet=True)
+                return
+            self._schedule_poll()
+
+        def failed(exc: BaseException) -> None:
+            # a hiccup while polling must not abort a running install
+            self.app.log(f"Progress check failed: {exc}")
+            self._schedule_poll(self.POLL_MS * 2)
+
+        self.app.worker.submit(work, done, failed, name="pkg-progress")
+
+    def _finish_tracking(self) -> None:
+        self._cancel_poll()
+        self.task = None
+        self.stop_button.set_enabled(False)
+        self._stop_server()
+
+    def stop_install(self) -> None:
+        installer, task = self.installer, self.task
+        if installer is None or task is None:
+            self._finish_tracking()
+            return
+        self.app.set_status(f"Stopping install task {task.task_id} ...", "warn")
+
+        def work() -> None:
+            installer.task_action("stop", task.task_id)
+
+        def done(_result: Any) -> None:
+            self.app.set_status("Install stopped. The console keeps what it already downloaded.", "warn")
+            self.progress_label.configure(text="Stopped.", fg=Theme.warn)
+            self._finish_tracking()
+
+        def failed(exc: BaseException) -> None:
+            self.app.set_status(f"Could not stop the task: {exc}", "bad")
+            self._finish_tracking()
+
+        self.app.worker.submit(work, done, failed, name="pkg-stop")
+
+    def _stop_server(self) -> None:
+        server, self.server = self.server, None
+        if server is not None:
+            server.stop()
+
+    # -- files on the console -----------------------------------------------
+    def refresh_console_pkgs(self, quiet: bool = False) -> None:
+        # Deliberately not require_ftp(): listing is a side job here and must
+        # never overwrite a status message that matters (an install finishing).
+        ftp = self.app.ftp
+        if ftp is None:
+            if not quiet:
+                self.console_hint.configure(text="connect to your PS4 to list its package files")
+            return
+        directory = self.pkg_dir()
+
+        def work() -> List[RemoteEntry]:
+            try:
+                ftp.ensure_dir(directory)
+            except Exception:
+                pass
+            return pkg_manager.pkg_entries(ftp.listdir(directory))
+
+        def done(entries: List[RemoteEntry]) -> None:
+            self.console_rows.clear()
+            self.console_tree.delete(*self.console_tree.get_children())
+            if not entries:
+                self.console_tree.insert("", "end", text=f"  (no .pkg files in {directory})",
+                                         values=("", ""), tags=("empty",))
+            for entry in entries:
+                iid = f"pkg::{entry.path}"
+                self.console_rows[iid] = entry
+                self.console_tree.insert("", "end", iid=iid, text="   " + entry.name,
+                                         values=(fmt_size(entry.size), directory), tags=("ok",))
+            total = sum(e.size or 0 for e in entries)
+            self.console_hint.configure(text=f"{len(entries)} file(s), {fmt_size(total)}" if entries else "")
+
+        def failed(exc: BaseException) -> None:
+            self.app.set_status(f"Could not list {directory}: {exc}", "bad")
+
+        self.app.worker.submit(work, done, failed, name="pkg-list")
+
+    def send_pkgs_to_console(self) -> None:
+        ftp = self.require_ftp()
+        if ftp is None:
+            return
+        chosen = filedialog.askopenfilenames(
+            parent=self, title=f"Send to {self.pkg_dir()} on the PS4",
+            filetypes=[("PS4 packages", "*.pkg"), ("All files", "*.*")])
+        if not chosen:
+            return
+        directory = self.pkg_dir()
+        paths = [Path(p) for p in chosen]
+        self.app.begin_busy(f"Sending {len(paths)} file(s) to the PS4 ...")
+
+        def work() -> List[str]:
+            ftp.ensure_dir(directory)
+            sent: List[str] = []
+            for path in paths:
+                remote = join_remote(directory, path.name)
+                ftp.upload(path, remote, progress=self.app.worker.progress(self.app.on_progress))
+                sent.append(remote)
+            return sent
+
+        def done(sent: List[str]) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Sent {len(sent)} file(s) to {directory} on the PS4.", "good")
+            self.app.log("Sent: " + ", ".join(sent))
+            self.refresh_console_pkgs()
+
+        def failed(exc: BaseException) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Send failed: {exc}", "bad")
+
+        self.app.worker.submit(work, done, failed, name="pkg-send")
+
+    def delete_console_pkgs(self) -> None:
+        ftp = self.require_ftp()
+        if ftp is None:
+            return
+        selected = [self.console_rows.get(iid) for iid in self.console_tree.selection()]
+        selected = [entry for entry in selected if entry is not None]
+        if not selected:
+            self.app.set_status("Select the package file(s) you want to delete from the PS4.", "warn")
+            return
+        names = ", ".join(e.name for e in selected[:3])
+        more = "" if len(selected) <= 3 else f" and {len(selected) - 3} more"
+        if not messagebox.askyesno(
+                "Delete from the PS4",
+                f"Delete {names}{more} from the console?\n\n"
+                "This only removes the stored package file - a game that is already installed stays installed.",
+                parent=self):
+            return
+        self.app.begin_busy("Deleting ...")
+
+        def work() -> int:
+            for entry in selected:
+                ftp.delete(entry.path)
+            return len(selected)
+
+        def done(count: int) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Deleted {count} package file(s) from the PS4.", "good")
+            self.refresh_console_pkgs()
+
+        def failed(exc: BaseException) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Delete failed: {exc}", "bad")
+
+        self.app.worker.submit(work, done, failed, name="pkg-delete")
+
+    # -- installed titles ---------------------------------------------------
+    def refresh_installed(self, quiet: bool = False) -> None:
+        ftp = self.app.ftp
+        if ftp is None:
+            if not quiet:
+                self.apps_hint.configure(text="connect to your PS4 to list what is installed")
+            return
+
+        def work() -> List[RemoteEntry]:
+            # The two appmeta directories are usually the same content through
+            # different mounts, so collect by name instead of by listing.
+            found: Dict[str, RemoteEntry] = {}
+            for directory in APPMETA_DIRS:
+                try:
+                    entries = ftp.listdir(directory)
+                except Exception:
+                    continue
+                for entry in entries:
+                    if not entry.is_dir or not is_title_id(entry.name):
+                        continue
+                    if entry.name.upper().startswith("NPXS"):  # system apps
+                        continue
+                    found.setdefault(entry.name, entry)
+            return [found[name] for name in sorted(found)]
+
+        def done(entries: List[RemoteEntry]) -> None:
+            self.installed_rows.clear()
+            self.apps_tree.delete(*self.apps_tree.get_children())
+            if not entries:
+                self.apps_tree.insert("", "end", text="  (nothing found)", tags=("empty",))
+            for entry in entries:
+                iid = f"app::{entry.name}"
+                self.installed_rows[iid] = entry
+                title = self.app.titles.get(entry.name.upper(), "")
+                label = f"{entry.name}   {title}" if title else entry.name
+                self.apps_tree.insert("", "end", iid=iid, text="   " + label, tags=("ok",))
+            self.apps_hint.configure(text=f"{len(entries)} title(s)" if entries else "")
+
+        def failed(exc: BaseException) -> None:
+            self.app.set_status(f"Could not read the installed titles: {exc}", "bad")
+
+        self.app.worker.submit(work, done, failed, name="pkg-installed")
+
+    def uninstall_selected(self) -> None:
+        installer = self.installer or self.make_installer()
+        if installer is None:
+            return
+        selected = [self.installed_rows.get(iid) for iid in self.apps_tree.selection()]
+        selected = [entry for entry in selected if entry is not None]
+        if not selected:
+            self.app.set_status("Select the title you want to remove from the PS4.", "warn")
+            return
+        title_id = norm_title_id(selected[0].name)
+        title = self.app.titles.get(title_id, "")
+        if not messagebox.askyesno(
+                "Uninstall from the PS4",
+                f"Uninstall {title_id}{' (' + title + ')' if title else ''} from the console?\n\n"
+                "The application is removed from the PS4. Saved data is left alone.",
+                parent=self):
+            return
+        if not installer.probe():
+            self.warn_no_service()
+            return
+        self.installer = installer
+        self.app.begin_busy(f"Uninstalling {title_id} ...")
+
+        def work() -> str:
+            installer.uninstall("game", title_id)
+            return title_id
+
+        def done(removed: str) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Uninstalled {removed} from the PS4.", "good")
+            self.refresh_installed()
+
+        def failed(exc: BaseException) -> None:
+            self.app.end_busy()
+            self.app.set_status(f"Uninstall failed: {exc}", "bad")
+
+        self.app.worker.submit(work, done, failed, name="pkg-uninstall")
+
+
 class SettingsView(VScrollFrame):
     """FTP credentials + behaviour settings."""
 
@@ -3221,6 +3923,7 @@ class Ps4ManagerApp(tk.Tk):
         self.views: Dict[str, tk.Frame] = {
             "plugins": PluginsView(self, self.content),
             "files": FilesView(self, self.content),
+            "pkgs": PkgManagerView(self, self.content),
             "settings": SettingsView(self, self.content),
         }
         for view in self.views.values():
@@ -3230,9 +3933,9 @@ class Ps4ManagerApp(tk.Tk):
         self.update_dirty_label()
 
     def make_tool_tabs(self, parent, active: str) -> tk.Frame:
-        """Small 'Plugins | Plugin files' switcher - both are part of the plugin tool."""
+        """Small 'Plugins | Plugin files | PKG manager' switcher - all part of the plugin tool."""
         strip = tk.Frame(parent, bg=Theme.bg)
-        for key, label in (("plugins", "Plugins"), ("files", "Plugin files")):
+        for key, label in (("plugins", "Plugins"), ("files", "Plugin files"), ("pkgs", "PKG manager")):
             button = CButton(strip, label, command=lambda k=key: self.show_view(k),
                              variant="nav", bg=Theme.bg, height=30, width=112)
             button.pack(side="left", padx=(4, 0))
@@ -3243,8 +3946,10 @@ class Ps4ManagerApp(tk.Tk):
     def show_view(self, key: str) -> None:
         self.current_view = key
         for name, button in self.nav_buttons.items():
-            # the file browser lives inside the Plugin tool, so keep it lit there
-            button.set_active(name == key or (name == "plugins" and key == "files"))
+            # the file browser and the PKG manager live inside the Plugin tool,
+            # so keep that nav button lit while they are open
+            inside_plugin_tool = key in ("files", "pkgs")
+            button.set_active(name == key or (name == "plugins" and inside_plugin_tool))
         for tab_key, tab_button in self.tool_tabs:
             tab_button.set_active(tab_key == key)
         view = self.views.get(key)
@@ -3257,6 +3962,8 @@ class Ps4ManagerApp(tk.Tk):
                 files_view.jump()
         if key == "settings" and isinstance(view, SettingsView):
             view.load_from_config()
+        if key == "pkgs" and isinstance(view, PkgManagerView):
+            view.on_shown()
 
     # -- status / logging -------------------------------------------------
     def set_status(self, message: str, kind: str = "info") -> None:
@@ -3790,6 +4497,10 @@ class Ps4ManagerApp(tk.Tk):
 
     # -- window -----------------------------------------------------------
     def on_close(self) -> None:
+        # Stop serving packages and stop polling the console before the widgets go
+        pkg_view = self.views.get("pkgs")
+        if isinstance(pkg_view, PkgManagerView):
+            pkg_view.shutdown()
         # Remember the FTP details even if Save was never pressed: the whole point
         # of the "Saved PS4" card is never having to type the address twice.
         view = self.views.get("settings")
