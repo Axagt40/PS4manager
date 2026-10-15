@@ -739,7 +739,7 @@ class TestPkgRemoteInstaller(unittest.TestCase):
 
 @unittest.skipUnless(_tk_usable(), "needs tkinter + a display")
 class TestPkgManagerView(unittest.TestCase):
-    """The PKG manager tab inside the plugin tool."""
+    """The PKG manager: its own page in the sidebar."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -758,14 +758,30 @@ class TestPkgManagerView(unittest.TestCase):
         m.CONFIG_FILE = self._real_config_file
         self._tmp.cleanup()
 
-    def test_tab_is_part_of_the_plugin_tool(self) -> None:
+    def test_it_is_its_own_sidebar_page(self) -> None:
         view = self.app.views["pkgs"]
         self.assertIsInstance(view, m.PkgManagerView)
         self.app.show_view("pkgs")
         self.assertEqual(self.app.current_view, "pkgs")
-        # the sidebar keeps the plugin tool lit for every tab inside it
+        # its own sidebar entry, highlighted while it is open - not a tab of the
+        # plugin tool, which must not stay lit for it either
+        self.assertTrue(self.app.nav_buttons["pkgs"]._active)
+        self.assertFalse(self.app.nav_buttons["plugins"]._active)
+        self.assertFalse(any(key == "pkgs" for key, _button in self.app.tool_tabs))
+        # the plugin tool keeps its own two tabs, "Plugin files" among them
+        self.assertEqual([key for key, _b in self.app.tool_tabs],
+                         ["plugins", "files", "plugins", "files"])
+
+    def test_the_sidebar_reads_plugin_tool_then_pkg_manager_then_settings(self) -> None:
+        self.assertEqual(list(self.app.nav_buttons), ["plugins", "pkgs", "settings"])
+        for key in ("plugins", "pkgs", "settings"):
+            self.app.show_view(key)
+            self.assertEqual(self.app.current_view, key)
+            self.assertTrue(self.app.nav_buttons[key]._active, f"{key} not highlighted")
+        # a tab inside the plugin tool keeps the plugin tool's entry lit
+        self.app.show_view("files")
         self.assertTrue(self.app.nav_buttons["plugins"]._active)
-        self.assertTrue(any(key == "pkgs" for key, _button in self.app.tool_tabs))
+        self.assertFalse(self.app.nav_buttons["pkgs"]._active)
 
     def test_defaults_and_helpers(self) -> None:
         view = self.app.views["pkgs"]
@@ -1225,6 +1241,80 @@ class TestPayloaderConnectFlow(unittest.TestCase):
         self.assertIn("GoldHEN", view.payload_result.cget("text"))
         self.assertEqual(self.app.worker.busy, 0, "the busy indicator must be cleared")
         self.assertEqual(self.mock.connections, 1)
+
+
+@unittest.skipUnless(_tk_usable(), "needs tkinter + a display")
+class TestToolTabsStayVisible(unittest.TestCase):
+    """The plugin tool's tabs must survive a narrow window.
+
+    The strip is packed to the right of a title block that grows with the path
+    on the console, so Tk used to squeeze the tabs - and the rightmost one
+    collapsed to 1 px at the app's own minimum size, which looks exactly like a
+    missing feature. The PKG manager is *not* one of these tabs: it has its own
+    sidebar entry (see TestPkgManagerView).
+    """
+
+    TAB_ORDER = ("Plugins", "Plugin files")
+
+    def setUp(self) -> None:
+        self.app = m.Ps4ManagerApp(m.Config(host="", auto_connect=False))
+        self.app.withdraw()
+
+    def tearDown(self) -> None:
+        try:
+            self.app.worker.stop()
+            self.app.destroy()
+        except Exception:
+            pass
+
+    def pump(self, seconds: float = 0.4) -> None:
+        end = time.time() + seconds
+        while time.time() < end:
+            self.app.update()
+            time.sleep(0.02)
+
+    def strips(self, view) -> list:
+        """The tab strip that belongs to this view (the app records every strip)."""
+        found = []
+        for strip in getattr(self.app, "tab_strips", []):
+            node = strip.master
+            while node is not None:
+                if node is view:
+                    found.append(strip)
+                    break
+                node = node.master
+        return found
+
+    def test_every_tab_keeps_its_width_in_every_view(self) -> None:
+        """Fixed widths *and* priority: together they stop the squeeze."""
+        # 900x580 is the app's own minimum - the size where the tab vanished
+        self.app.geometry("900x580")
+        self.pump(0.6)
+        for view_key in ("plugins", "files"):
+            strips = self.strips(self.app.views[view_key])
+            self.assertEqual(len(strips), 1, f"{view_key}: exactly one tab strip")
+            strip = strips[0]
+            buttons = strip.winfo_children()
+            self.assertEqual(len(buttons), len(self.TAB_ORDER), f"{view_key}: tab count changed")
+            self.assertEqual([b.winfo_reqwidth() for b in buttons], [112] * len(self.TAB_ORDER),
+                             f"{view_key}: tabs no longer ask for their full width")
+            self.assertEqual(strip.winfo_reqwidth(), 116 * len(self.TAB_ORDER),
+                             f"{view_key}: strip ask-size changed")
+            self.assertNotIn("pkgs", [k for k, _b in self.app.tool_tabs],
+                             "the PKG manager must not be a tab of the plugin tool")
+            # Every level from the strip up to the view must be packed before its
+            # siblings, so Tk hands the tabs their width before the long title
+            # block beside them can take the space away.
+            node = strip
+            while node.master is not None and node.master is not self.app.views[view_key]:
+                parent = node.master
+                self.assertIs(parent.pack_slaves()[0], node,
+                              f"{view_key}: {node.__class__.__name__} is not packed first in "
+                              f"{parent.__class__.__name__} - the tabs would be squeezed")
+                node = parent
+            # the switcher really switches to the page it labels
+            self.app.show_view(view_key)
+            self.assertEqual(self.app.current_view, view_key)
 
 
 class TestMissingSiblingModule(unittest.TestCase):

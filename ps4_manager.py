@@ -72,7 +72,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 DEFAULT_PORT = 2121
 # GoldHEN's payload server ("BinLoader"). 9090 is the default; GoldHEN can also
 # listen on 9020/9021, which is why the port is configurable.
@@ -2332,21 +2332,25 @@ class PluginsView(tk.Frame):
 
         head = tk.Frame(self, bg=Theme.bg)
         head.pack(fill="x", padx=24, pady=(20, 0))
+        # The tab strip is packed *before* the title block on purpose. Tk hands out
+        # space in packing order, and the long path under the title grows without
+        # bound - so without this the strip is what gets squeezed, and "PKG
+        # manager" is the first tab to shrink away in a narrow window.
+        right = tk.Frame(head, bg=Theme.bg)
+        right.pack(side="right")
+        # the file browser and the PKG manager are part of the plugin tool: switch here
+        self.app.make_tool_tabs(right, "plugins").pack(side="right", padx=(14, 0))
+        self.dirty_label = tk.Label(right, text="", bg=Theme.bg, fg=Theme.warn, font=Theme.font_small)
+        self.dirty_label.pack(side="left", padx=(0, 12))
+        self.save_button = CButton(right, "Save to PS4", command=self.app.apply_async, variant="primary")
+        self.save_button.pack(side="left")
+
         left = tk.Frame(head, bg=Theme.bg)
         left.pack(side="left")
         tk.Label(left, text="GoldHEN plugins", bg=Theme.bg, fg=Theme.text, font=Theme.font_h1).pack(anchor="w")
         self.subtitle = tk.Label(left, text=self.app.ini_path_label(), bg=Theme.bg, fg=Theme.muted,
                                  font=Theme.font_small)
         self.subtitle.pack(anchor="w", pady=(2, 0))
-
-        right = tk.Frame(head, bg=Theme.bg)
-        right.pack(side="right")
-        self.dirty_label = tk.Label(right, text="", bg=Theme.bg, fg=Theme.warn, font=Theme.font_small)
-        self.dirty_label.pack(side="left", padx=(0, 12))
-        self.save_button = CButton(right, "Save to PS4", command=self.app.apply_async, variant="primary")
-        self.save_button.pack(side="left")
-        # the file browser is part of the plugin tool - switch to it from here
-        self.app.make_tool_tabs(right, "plugins").pack(side="right", padx=(14, 0))
 
         toolbar = tk.Frame(self, bg=Theme.bg)
         toolbar.pack(fill="x", padx=24, pady=(14, 0))
@@ -2795,13 +2799,14 @@ class FilesView(tk.Frame):
         self.app = app
         head = tk.Frame(self, bg=Theme.bg)
         head.pack(fill="x", padx=24, pady=(20, 12))
+        # tabs first, title last - see the note in PluginsView above
+        self.app.make_tool_tabs(head, "files").pack(side="right")
+        CButton(head, "Jump to plugins folder", command=self.jump, bg=Theme.bg).pack(side="right", padx=(0, 8))
         left = tk.Frame(head, bg=Theme.bg)
         left.pack(side="left")
         tk.Label(left, text="Plugin files", bg=Theme.bg, fg=Theme.text, font=Theme.font_h1).pack(anchor="w")
         tk.Label(left, text=f"Folders and files on the PS4 — start folder: {app.config.remote_plugins_dir}",
                  bg=Theme.bg, fg=Theme.muted, font=Theme.font_small).pack(anchor="w", pady=(2, 0))
-        self.app.make_tool_tabs(head, "files").pack(side="right")
-        CButton(head, "Jump to plugins folder", command=self.jump, bg=Theme.bg).pack(side="right", padx=(0, 8))
         self.browser = RemoteBrowser(self, app, on_open_file=self.download_file)
         self.browser.pack(fill="both", expand=True, padx=24)
 
@@ -2937,7 +2942,7 @@ Alternative - GoldHEN's payload server
   listening after one connection - if the pill says "Payload no reply", toggle
   BinLoader on the console again.
 
-Without that service the rest of this tab still works
+Without that service the rest of this page still works
   "Send a .pkg ..." moves packages onto the console over FTP and deletes them
   again, and the installed-titles list reads the console's own database - handy
   together with the console's own installers (Itemzflow, FPKGi), or to keep a
@@ -2977,7 +2982,7 @@ class PkgSetupDialog(ModalDialog):
 
 
 class PkgManagerView(tk.Frame):
-    """Install, remove and move .pkg files - the plugin tool's third tab.
+    """Install, remove and move .pkg files - its own page beside the plugin tool.
 
     Everything the console has to do is done by the console: it downloads the
     package from this PC (direct link or a local file served over HTTP) and
@@ -3001,6 +3006,11 @@ class PkgManagerView(tk.Frame):
 
         head = tk.Frame(self, bg=Theme.bg)
         head.pack(fill="x", padx=24, pady=(20, 0))
+        # tabs first, title last - see the note in PluginsView above
+        right = tk.Frame(head, bg=Theme.bg)
+        right.pack(side="right")
+        self.service_pill = StatusPill(right, bg=Theme.bg)
+        self.service_pill.pack(side="right")
         left = tk.Frame(head, bg=Theme.bg)
         left.pack(side="left")
         tk.Label(left, text="PKG manager", bg=Theme.bg, fg=Theme.text,
@@ -3009,11 +3019,6 @@ class PkgManagerView(tk.Frame):
             left, text="Install a .pkg from a link or straight from this PC - the PS4 downloads it itself.",
             bg=Theme.bg, fg=Theme.muted, font=Theme.font_small)
         self.subtitle.pack(anchor="w", pady=(2, 0))
-        right = tk.Frame(head, bg=Theme.bg)
-        right.pack(side="right")
-        self.app.make_tool_tabs(right, "pkgs").pack(side="right", padx=(14, 0))
-        self.service_pill = StatusPill(right, bg=Theme.bg)
-        self.service_pill.pack(side="right")
 
         body = VScrollFrame(self, bg=Theme.bg)
         body.pack(fill="both", expand=True, padx=24, pady=(14, 14))
@@ -3170,7 +3175,7 @@ class PkgManagerView(tk.Frame):
             return None
         return self.app.ftp
 
-    # -- what happens when the tab opens -----------------------------------
+    # -- what happens when the page opens ----------------------------------
     def on_shown(self) -> None:
         if not self._checked:
             self._checked = True
@@ -4105,6 +4110,7 @@ class Ps4ManagerApp(tk.Tk):
         self.minsize(900, 580)
         self.worker = Worker(self)
         self.tool_tabs: List[Tuple[str, CButton]] = []
+        self.tab_strips: List[tk.Frame] = []
 
         self.load_title_cache()
         self._build_layout()
@@ -4195,7 +4201,8 @@ class Ps4ManagerApp(tk.Tk):
         self.content.pack(side="left", fill="both", expand=True)
 
         self.nav_buttons: Dict[str, CButton] = {}
-        for index, (key, label) in enumerate((("plugins", "Plugin tool"), ("settings", "Settings"))):
+        for index, (key, label) in enumerate((("plugins", "Plugin tool"), ("pkgs", "PKG manager"),
+                                              ("settings", "Settings"))):
             button = CButton(sidebar, "   " + label, command=lambda k=key: self.show_view(k),
                              variant="nav", bg=Theme.bg, height=38, width=180, anchor="w", padx=14)
             button.pack(padx=8, pady=(12 if index == 0 else 4, 0))
@@ -4240,9 +4247,14 @@ class Ps4ManagerApp(tk.Tk):
         self.update_dirty_label()
 
     def make_tool_tabs(self, parent, active: str) -> tk.Frame:
-        """Small 'Plugins | Plugin files | PKG manager' switcher - all part of the plugin tool."""
+        """'Plugins | Plugin files' switcher - both inside the plugin tool.
+
+        The PKG manager is *not* a tab: it has its own entry in the sidebar beside
+        the plugin tool and the settings, where it is a full page of its own.
+        """
         strip = tk.Frame(parent, bg=Theme.bg)
-        for key, label in (("plugins", "Plugins"), ("files", "Plugin files"), ("pkgs", "PKG manager")):
+        self.tab_strips.append(strip)      # so the layout can be checked (see the tests)
+        for key, label in (("plugins", "Plugins"), ("files", "Plugin files")):
             button = CButton(strip, label, command=lambda k=key: self.show_view(k),
                              variant="nav", bg=Theme.bg, height=30, width=112)
             button.pack(side="left", padx=(4, 0))
@@ -4253,9 +4265,9 @@ class Ps4ManagerApp(tk.Tk):
     def show_view(self, key: str) -> None:
         self.current_view = key
         for name, button in self.nav_buttons.items():
-            # the file browser and the PKG manager live inside the Plugin tool,
-            # so keep that nav button lit while they are open
-            inside_plugin_tool = key in ("files", "pkgs")
+            # the file browser is a tab of the Plugin tool, so keep that nav
+            # button lit while it is open (the PKG manager has its own entry)
+            inside_plugin_tool = key == "files"
             button.set_active(name == key or (name == "plugins" and inside_plugin_tool))
         for tab_key, tab_button in self.tool_tabs:
             tab_button.set_active(tab_key == key)

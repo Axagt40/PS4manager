@@ -45,7 +45,7 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 **Plugin files**
 - Browse, upload, download, delete, create folders — all over FTP.
 
-**PKG manager** (third tab of the plugin tool)
+**PKG manager** (its own entry in the sidebar, beside the plugin tool)
 - **Install from a link**: paste a `http(s)://` URL to a `.pkg` (or to a `.json` manifest) and the
   PS4 downloads and installs it by itself.
 - **Install from this PC**: pick a `.pkg` on your PC and it is streamed to the console over HTTP
@@ -58,7 +58,7 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 - **Installed on the PS4** lists the console's titles (system apps hidden, names from your title
   cache) and can **uninstall** one without touching the console.
 - Installing and uninstalling need one small homebrew service on the console — *Remote Package
-  Installer*, listening on port 12800. The tab checks for it automatically and explains the
+  Installer*, listening on port 12800. The page checks for it automatically and explains the
   one-time setup when it is missing (*How to set it up*). Sending and deleting files only needs
   GoldHEN's FTP, so that half works with no extra setup at all.
 
@@ -186,10 +186,11 @@ UI being driven, use a throwaway virtual display, which needs no code change:
   `550`); game names fall back to the title id and nothing else breaks.
 - Big bogus sizes: GoldHEN's FTP reports nonsense sizes for a few very large files — cosmetic only.
 - *“Installer not running” in the PKG manager* — the console-side service on port 12800 is not up.
-  Press **How to set it up** in that tab: install the *Remote Package Installer* homebrew once
+  Press **How to set it up** there: install the *Remote Package Installer* homebrew once
   (title id `FLTZ00003`, a store build — flatz's GitHub has the source and building it needs the
   private PS4 SDK) and start it before a transfer. Sending/deleting `.pkg` files on the console
   keeps working without it.
-- *The console never starts downloading* — the PS4 has to reach your PC on the port the tab shows.
+- *The console never starts downloading* — the PS4 has to reach your PC on the port shown in the
+  PKG manager.
   If a firewall is up, allow that port (`sudo ufw allow 9898/tcp`). One transfer at a time: the
   console's downloader queues the rest.
