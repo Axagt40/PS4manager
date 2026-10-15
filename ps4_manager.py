@@ -72,7 +72,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.0.0"
 DEFAULT_PORT = 2121
 # GoldHEN's payload server ("BinLoader"). 9090 is the default; GoldHEN can also
 # listen on 9020/9021, which is why the port is configurable.
