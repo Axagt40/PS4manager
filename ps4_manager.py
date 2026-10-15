@@ -72,11 +72,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP_NAME = "PS4 Manager"
 APP_TAGLINE = "Tools for a jailbroken PS4 over FTP"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 DEFAULT_PORT = 2121
 # GoldHEN's payload server ("BinLoader"). 9090 is the default; GoldHEN can also
-# listen on 9020/9021, which is why the port is configurable.
+# listen on 9020/9021, which is why the port is configurable - and why the app
+# tries all three before it reports that nothing is listening.
 DEFAULT_PAYLOAD_PORT = 9090
+PAYLOAD_PORT_CHOICES = (DEFAULT_PAYLOAD_PORT, 9020, 9021)
 DEFAULT_INI = "/data/GoldHEN/plugins.ini"
 DEFAULT_PLUGINS_DIR = "/data/GoldHEN/plugins"
 DEFAULT_SECTION = "default"
@@ -1183,6 +1185,40 @@ class Payloader:
                 break
             chunks.append(chunk)
         return b"".join(chunks).decode("utf-8", "replace").strip()
+
+
+def connect_payloader(host: str, port: int = DEFAULT_PAYLOAD_PORT, timeout: float = 20.0,
+                      logger: Optional[Callable[[str], None]] = None
+                      ) -> Tuple[Optional[Payloader], str]:
+    """Connect to the console's payload server, trying GoldHEN's usual ports.
+
+    Returns the connected client (or None) and a short reason when it failed.
+    GoldHEN can bind 9090, 9020 or 9021, so a *refused* connection moves on to the
+    other two: a wrong port in the settings then costs one round trip instead of
+    looking like a console-side problem. A timeout stops the search - that is a
+    network or firewall problem, and more ports would only take longer.
+    """
+    wanted = int(port)
+    ports = [wanted] + [p for p in PAYLOAD_PORT_CHOICES if p != wanted]
+    for candidate in ports:
+        payloader = Payloader(host=str(host).strip(), port=candidate,
+                              timeout=max(3.0, min(float(timeout), 30.0)), logger=logger)
+        try:
+            payloader.connect()
+        except PayloaderError as exc:
+            reason = " ".join(str(exc).split())
+            payloader.close()
+            if logger:
+                logger(f"Payload server on {host}:{candidate}: {reason}")
+            if "Nothing is listening" not in str(exc):
+                return None, reason          # timeout/other: another port will not help
+            continue
+        if candidate != wanted and logger:
+            logger(f"The payload server answered on port {candidate}, not {wanted}.")
+        return payloader, ""
+    return None, (f"no payload server on {str(host).strip()} "
+                  f"(tried {', '.join(str(p) for p in ports)}) - "
+                  "switch BinLoader on in GoldHEN's settings")
 
 
 # ---------------------------------------------------------------------------
@@ -3738,7 +3774,9 @@ class SettingsView(VScrollFrame):
             "Payload server (optional)",
             "GoldHEN's payload server - BinLoader - is switched on in GoldHEN's settings, not "
             "here. Save its address and the manager connects to it together with FTP: one "
-            "Connect button, nothing extra to press. Empty means the manager stays on FTP only.")
+            "Connect button, nothing extra to press. Empty means the manager stays on FTP only. "
+            "GoldHEN may listen on 9090, 9020 or 9021 - all three are tried, so the port only "
+            "has to be right if you changed it yourself.")
         self._entry_row(body, "payloader_host", "PS4 address", hint="empty = payloader off", width=22)
         self._entry_row(body, "payloader_port", "Payload port", default=str(DEFAULT_PAYLOAD_PORT),
                         hint="9090 in GoldHEN unless you changed it", width=10)
@@ -3787,22 +3825,33 @@ class SettingsView(VScrollFrame):
                          logger=self.app.bg_log)
 
     def test_payloader(self) -> None:
-        payloader = self._typed_payloader()
-        if payloader is None:
+        typed = self._typed_payloader()
+        if typed is None:
             self.payload_result.configure(text="Enter the console's address in the payloader card - "
                                                "the payload server runs on the PS4.", fg=Theme.warn)
             return
-        self.payload_result.configure(text=f"Talking to {payloader.host}:{payloader.port} ...",
-                                      fg=Theme.text_dim)
+        host, port = typed.host, typed.port
+        timeout = float(self.app.config.timeout or 20)
+        self.payload_result.configure(
+            text=f"Talking to {host}:{port} (and GoldHEN's other payload ports) ...",
+            fg=Theme.text_dim)
         self.app.begin_busy("Testing the payload server ...")
 
-        def work() -> str:
-            return payloader.probe()
+        def work() -> Tuple[Optional[Payloader], str]:
+            return connect_payloader(host, port, timeout=timeout, logger=self.app.bg_log)
 
-        def done(summary: str) -> None:
+        def done(result: Tuple[Optional[Payloader], str]) -> None:
+            payloader, error = result
             self.app.end_busy()
+            if payloader is None:
+                self.payload_result.configure(text=f"✗  {error}", fg=Theme.bad)
+                self.app.set_status("Payload server did not answer.", "warn")
+                return
+            summary = payloader.banner_summary()
+            found = payloader.port
+            payloader.close()      # a test must not hold the console's single connection
             self.payload_result.configure(
-                text=f"✔  Payload server answered at {payloader.host}:{payloader.port}: {summary}. "
+                text=f"✔  Payload server answered at {host}:{found}: {summary}. "
                      "Connect picks it up together with FTP.", fg=Theme.good)
             self.app.set_status("Payload server reachable.", "good")
 
@@ -4459,12 +4508,9 @@ class Ps4ManagerApp(tk.Tk):
             payload_error = ""
             if config.payloader_enabled:
                 # a payload server that stays silent must never cost the FTP session
-                try:
-                    payloader = config.make_payloader(self.bg_log)
-                    payloader.connect()
-                except PayloaderError as exc:
-                    payloader = None
-                    payload_error = " ".join(str(exc).split())
+                payloader, payload_error = connect_payloader(
+                    config.payloader_host, config.payloader_port_number(),
+                    timeout=float(config.timeout), logger=self.bg_log)
             return ftp, payloader, payload_error
 
         def done(result: Tuple[Ps4Ftp, Optional[Payloader], str]) -> None:
@@ -4478,9 +4524,12 @@ class Ps4ManagerApp(tk.Tk):
             self.connect_button.set_variant("secondary")
             self.log(f"Connected to {config.host}:{config.port}")
             if payloader is not None:
-                self.log(f"Payload server ready: {payloader.banner_summary()}")
-                self.set_status(f"Connected to {config.host} - payload server ready "
-                                f"({payloader.banner_summary()}).", "good")
+                summary = payloader.banner_summary()
+                where = ("" if payloader.port == config.payloader_port_number()
+                         else f" on port {payloader.port}")
+                self.log(f"Payload server ready{where}: {summary}")
+                self.set_status(f"Connected to {config.host} - payload server ready{where} "
+                                f"({summary}).", "good")
             elif payload_error:
                 self.set_status(f"Connected to {config.host} - FTP only, {payload_error}", "warn")
             else:

@@ -1071,6 +1071,61 @@ class TestPayloaderClient(unittest.TestCase):
             payloader.send_bytes(b"\x00")
 
 
+class TestPayloadPortSearch(unittest.TestCase):
+    """GoldHEN can bind 9090, 9020 or 9021 - a wrong port must not be a dead end."""
+
+    def setUp(self) -> None:
+        self._real_choices = m.PAYLOAD_PORT_CHOICES
+
+    def tearDown(self) -> None:
+        m.PAYLOAD_PORT_CHOICES = self._real_choices
+
+    @staticmethod
+    def closed_port() -> int:
+        """A port number nothing is listening on (bound, then released)."""
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        port = spare.getsockname()[1]
+        spare.close()
+        return port
+
+    def test_the_configured_port_wins_when_it_answers(self) -> None:
+        mock = MockBinLoader()
+        try:
+            payloader, error = m.connect_payloader("127.0.0.1", mock.port, timeout=3)
+            self.assertIsNotNone(payloader, error)
+            self.assertEqual(error, "")
+            self.assertEqual(payloader.port, mock.port)
+            self.assertEqual(mock.connections, 1)
+            payloader.close()
+        finally:
+            mock.close()
+
+    def test_a_dead_port_falls_through_to_the_port_goldhen_uses(self) -> None:
+        mock = MockBinLoader()
+        m.PAYLOAD_PORT_CHOICES = (mock.port,)      # stands in for GoldHEN's 9020/9021
+        try:
+            payloader, error = m.connect_payloader("127.0.0.1", self.closed_port(), timeout=3)
+            self.assertIsNotNone(payloader, error)
+            self.assertEqual(error, "")
+            self.assertEqual(payloader.port, mock.port, "the answering port must be reported")
+            self.assertEqual(payloader.banner_summary(), "GoldHEN BinLoader v2.4b18.3")
+            payloader.close()
+        finally:
+            mock.close()
+
+    def test_nothing_listening_says_which_ports_were_tried(self) -> None:
+        first, second = self.closed_port(), self.closed_port()
+        m.PAYLOAD_PORT_CHOICES = (first, second)
+        configured = self.closed_port()
+        payloader, error = m.connect_payloader("127.0.0.1", configured, timeout=2)
+        self.assertIsNone(payloader)
+        self.assertIn("no payload server", error)
+        self.assertIn("BinLoader", error, "the message must say what to switch on")
+        for port in (configured, first, second):
+            self.assertIn(str(port), error, "every port that was tried belongs in the message")
+
+
 class TestPayloaderSettings(unittest.TestCase):
     """An address in the settings is the opt-in - nothing else to press."""
 
@@ -1205,7 +1260,26 @@ class TestPayloaderConnectFlow(unittest.TestCase):
         self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload no reply")
         status = self.app.status_label.cget("text").lower()
         self.assertIn("ftp only", status)
-        self.assertIn("nothing is listening", status)
+        self.assertIn("no payload server", status)
+        self.assertIn("binloader", status)
+
+    def test_a_wrong_saved_port_is_recovered_on_connect(self) -> None:
+        """The address is what the user knows; GoldHEN's port can be any of three."""
+        real = m.PAYLOAD_PORT_CHOICES
+        m.PAYLOAD_PORT_CHOICES = (self.mock.port,)
+        spare = socket.socket()
+        spare.bind(("127.0.0.1", 0))
+        dead = spare.getsockname()[1]
+        spare.close()
+        try:
+            self.connect("127.0.0.1", dead)
+        finally:
+            m.PAYLOAD_PORT_CHOICES = real
+        self.assertIsNotNone(self.app.payloader)
+        self.assertEqual(self.app.payloader.port, self.mock.port)
+        self.assertEqual(self.app.pay_pill.label.cget("text"), "Payload ready")
+        status = self.app.status_label.cget("text")
+        self.assertIn(f"port {self.mock.port}", status, "the status must name the port that answered")
 
     def test_without_an_address_the_payloader_is_never_touched(self) -> None:
         self.connect("")

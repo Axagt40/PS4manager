@@ -85,7 +85,8 @@ It remembers your PS4's address, connects on startup and shows every plugin from
 **Payload server (optional)**
 - Settings has a **Payload server** card for GoldHEN's payload server (*BinLoader*, default port
   `9090`). Fill in the address and it connects **together with FTP, on the same Connect button** —
-  no second button and no second step. A second pill in the header says *Payload off*,
+  no second button and no second step. GoldHEN can bind `9090`, `9020` or `9021`: all three are
+  tried, and the header/log name the port that answered, so a stale port number is not a dead end. A second pill in the header says *Payload off*,
   *Payload ready* or *Payload no reply*, and a payload server that stays silent never costs you the
   FTP session: you still get connected, the status line just says "FTP only" and why.
 - Leave the address empty and the manager never opens the port. *Use the PS4 address above* copies
