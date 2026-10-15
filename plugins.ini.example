@@ -1,0 +1,17 @@
+; Example of the file PS4 Manager edits on the console: /data/GoldHEN/plugins.ini
+;
+;   [default]       plugins that load for every game
+;   [<TITLE_ID>]    plugins that load only for that game (4 letters + 5 digits,
+;                   e.g. CUSA12345 - the app shows the real game name for each)
+;
+; =true / =false switches a plugin on or off (GoldHEN 2.3 and newer).
+; A bare path with no value counts as enabled.
+;
+; Everything here - comments, blank lines, section order, even unusual values -
+; is preserved when the app saves: a toggle changes only the value it has to.
+
+[default]
+/data/GoldHEN/plugins/example_plugin.prx=false
+
+[CUSA12345]
+/data/GoldHEN/plugins/example_game_plugin.prx=true

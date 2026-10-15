@@ -1,0 +1,19 @@
+# The app writes these next to the script while you use it. They hold your own
+# PS4's details (address, saved plugins, game names) and must never be published.
+ps4_manager_config.json
+title_cache.json
+plugins.ini
+backups/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Logs and scratch files
+*.log
+*.tmp
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
